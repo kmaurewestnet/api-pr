@@ -44,12 +44,14 @@ def _stream(metadata, resumen, dispositivos):
 )
 def analiticas_empresa(
     empresa_id: int = Path(..., description="ID de empresa en la base napear"),
-    horas: int = Query(
-        default=168, ge=1, le=720,
-        description="Ventana hacia atrás para buscar el último valor de estado y LOS "
-                    "en Zabbix. El default son 7 días: el estado operativo solo se "
-                    "escribe al cambiar, así que una ventana corta deja muchas ONUs "
-                    "en 'sin_datos'.",
+    horas: Optional[int] = Query(
+        default=None, ge=1, le=8760,
+        description="Antigüedad máxima aceptada para el último valor de estado y LOS. "
+                    "Sin este parámetro se trae el último valor real de cada ONU, sin "
+                    "importar cuándo se registró; usá 'status_timestamp' y "
+                    "'los_timestamp' para juzgar qué tan fresco es. Acotar la ventana "
+                    "solo sirve para descartar datos viejos, no para acelerar: la "
+                    "consulta ya entra por índice.",
     ),
     page: int = Query(default=1, ge=1),
     limit: int = Query(default=500, ge=1, le=5000),

@@ -15,6 +15,7 @@ participa del cruce: resolverla contra history_text era el cuello de botella.
 import logging
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import config
 import db
@@ -96,30 +97,69 @@ def obtener_onus(seriales):
 
 # --- Paso 3: zabbix -----------------------------------------------------------
 
-def obtener_metricas(precintos, desde):
-    """Estado y LOS en una sola consulta.
+def _guardar(destino, clave, clock, valor):
+    """Se queda con la lectura más reciente por precinto.
 
-    Devuelve {'status': {precinto: (valor, clock)}, 'los': {...}}. Una sola query
-    alcanza porque ambas métricas comparten la resolución precinto -> itemid.
+    La query ya deduplica por itemid; esto cubre el caso de un precinto que mapee
+    a más de un item. El clock va último en la tupla para no depender del largo.
     """
+    anterior = destino.get(clave)
+    if anterior is None or clock >= anterior[-1]:
+        destino[clave] = valor + (clock,)
+
+
+def _metricas_estado(precintos, desde):
+    """Estado y LOS: una sola query, comparten la resolución precinto -> itemid."""
     resultado = {"status": {}, "los": {}}
     with db.zabbix_conn() as conn:
         with db.cursor_pg(conn, config.STATEMENT_TIMEOUT_MS) as cur:
             for lote in _chunks(precintos, config.CHUNK_SIZE):
-                cur.execute(q.Q_ZBX_METRICAS, (lote, desde))
+                cur.execute(q.Q_ZBX_METRICAS, (lote, desde, desde))
                 for fila in cur.fetchall():
                     destino = resultado.get(fila["metrica"])
-                    if destino is None:
+                    clave = normalizar_precinto(fila["precinto"])
+                    if destino is None or not clave:
                         continue
+                    _guardar(destino, clave, fila["clock"] or 0, (fila["valor"],))
+    return resultado
+
+
+def _metricas_ldc(precintos, desde):
+    """Última causa de caída. Query aparte: vive en history_text, no history_str."""
+    resultado = {}
+    with db.zabbix_conn() as conn:
+        with db.cursor_pg(conn, config.STATEMENT_TIMEOUT_MS) as cur:
+            for lote in _chunks(precintos, config.CHUNK_SIZE):
+                cur.execute(q.Q_ZBX_LDC, (lote, desde, desde))
+                for fila in cur.fetchall():
                     clave = normalizar_precinto(fila["precinto"])
                     if not clave:
                         continue
-                    clock = fila["clock"] or 0
-                    anterior = destino.get(clave)
-                    # La query deduplica por itemid; si un precinto mapeara a más
-                    # de un item, nos quedamos con la lectura más reciente.
-                    if anterior is None or clock >= anterior[1]:
-                        destino[clave] = (fila["valor"], clock)
+                    _guardar(
+                        resultado, clave, fila["clock"] or 0,
+                        (fila["ldc"], fila["ldc_timestamp"]),
+                    )
+    return {"ldc": resultado}
+
+
+def obtener_metricas(precintos, desde):
+    """Estado, LOS y causa de caída.
+
+    `desde` en 0 desactiva el filtro temporal y trae el último valor real de cada
+    item, sin importar su antigüedad. Devuelve
+    {'status': {...}, 'los': {...}, 'ldc': {...}} indexado por precinto.
+
+    Las dos consultas son independientes (distinta tabla de historia, distintos
+    items), así que corren en paralelo con una conexión cada una.
+    """
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futuros = [
+            pool.submit(_metricas_estado, precintos, desde),
+            pool.submit(_metricas_ldc, precintos, desde),
+        ]
+        resultado = {}
+        for f in futuros:
+            resultado.update(f.result())
     return resultado
 
 
@@ -139,14 +179,27 @@ def _tiene_los(valor) -> bool:
 
 def cruzar(onus, metricas, nap_tags):
     """Une cada ONU de soldef con sus métricas de zabbix. Devuelve la lista completa."""
-    status, los = metricas["status"], metricas["los"]
+    status, los, ldc = metricas["status"], metricas["los"], metricas["ldc"]
     dispositivos = []
 
     for onu in onus:
         clave = normalizar_precinto(onu.get("precinto"))
         st_v = status.get(clave) if clave else None
         los_v = los.get(clave) if clave else None
+        ldc_v = ldc.get(clave) if clave else None
         serial = onu.get("serial")
+        con_los = _tiene_los(los_v[0]) if los_v else False
+
+        # La mayoría de las ONUs no tiene el item hwGponDeviceOntEthernetOnlineState:
+        # solo algunas plantillas lo incluyen. Cuando falta, la alarma LOS es el
+        # mejor proxy disponible (pérdida de señal óptica = ONU caída). El origen
+        # queda expuesto en la respuesta para que el dato sea interpretable.
+        if st_v:
+            estado, origen = ("online" if _es_online(st_v[0]) else "offline"), "onlinestate"
+        elif los_v:
+            estado, origen = ("offline" if con_los else "online"), "los"
+        else:
+            estado, origen = "sin_datos", None
 
         dispositivos.append(
             {
@@ -158,10 +211,11 @@ def cruzar(onus, metricas, nap_tags):
                 "status_timestamp": st_v[1] if st_v else None,
                 "los": los_v[0] if los_v else None,
                 "los_timestamp": los_v[1] if los_v else None,
-                "estado": ("online" if _es_online(st_v[0]) else "offline")
-                if st_v
-                else "sin_datos",
-                "con_los": _tiene_los(los_v[0]) if los_v else False,
+                "ldc": ldc_v[0] if ldc_v else None,
+                "ldc_timestamp": ldc_v[1] if ldc_v else None,
+                "estado": estado,
+                "origen_estado": origen,
+                "con_los": con_los,
             }
         )
     return dispositivos
@@ -170,6 +224,9 @@ def cruzar(onus, metricas, nap_tags):
 def resumir(dispositivos):
     """Agregados calculados en un solo pase sobre la lista."""
     online = offline = sin_datos = con_los = 0
+    # Cuántos estados salen del item autoritativo y cuántos del proxy de LOS:
+    # sirve para saber qué tan confiable es el resumen.
+    origenes = {"onlinestate": 0, "los": 0, "sin_datos": 0}
 
     for d in dispositivos:
         if d["estado"] == "online":
@@ -180,6 +237,7 @@ def resumir(dispositivos):
             sin_datos += 1
         if d["con_los"]:
             con_los += 1
+        origenes[d["origen_estado"] or "sin_datos"] += 1
 
     total = len(dispositivos)
     return {
@@ -189,6 +247,7 @@ def resumir(dispositivos):
         "sin_datos": sin_datos,
         "con_alarma_los": con_los,
         "porcentaje_online": round(100 * online / total, 2) if total else None,
+        "origen_estado": origenes,
     }
 
 
@@ -201,7 +260,8 @@ def analitica_empresa(empresa_id, horas):
         raise QueriesNoConfiguradas(pendientes)
 
     hasta = int(time.time())
-    desde = hasta - (horas * 3600)
+    # horas=None trae el último valor de cada item sin importar su antigüedad.
+    desde = hasta - (horas * 3600) if horas else 0
 
     t0 = time.perf_counter()
     seriales, nombre_empresa, nap_tags = obtener_ont_ids(empresa_id)
@@ -218,7 +278,9 @@ def analitica_empresa(empresa_id, horas):
     # sin_datos: no se descartan, solo no se consultan.
     precintos = list({p for p in (o.get("precinto") for o in onus) if p})
     metricas = (
-        obtener_metricas(precintos, desde) if precintos else {"status": {}, "los": {}}
+        obtener_metricas(precintos, desde)
+        if precintos
+        else {"status": {}, "los": {}, "ldc": {}}
     )
     t_zbx = time.perf_counter()
 
@@ -238,7 +300,7 @@ def analitica_empresa(empresa_id, horas):
         "total_seriales_napear": len(seriales),
         "total_onus": len(dispositivos),
         "rango_tiempo": {
-            "desde_timestamp": desde,
+            "desde_timestamp": desde or None,
             "hasta_timestamp": hasta,
             "horas_consultadas": horas,
         },

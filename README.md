@@ -35,15 +35,48 @@ GET /api/v1/empresa/{empresa_id}/analytics
 
 | Parámetro | Default | Rango | Uso |
 |---|---|---|---|
-| `horas` | 168 (7 días) | 1–720 | ventana para buscar el último estado y LOS en Zabbix |
+| `horas` | sin límite | 1–8760 | descarta lecturas más viejas que N horas |
 | `page` | 1 | ≥1 | página del listado |
 | `limit` | 500 | 1–5000 | tamaño de página |
 | `full` | false | | devuelve todo por streaming, ignorando `page`/`limit` |
 | `estado` | — | `online`\|`offline`\|`sin_datos`\|`los` | filtra el listado; el resumen siempre se calcula sobre el total |
 
-El default de `horas` son 7 días y no 6 horas porque el estado operativo en
-Zabbix solo se escribe cuando cambia: con una ventana corta la mayoría de las
-ONUs sanas quedarían en `sin_datos`.
+Por defecto **no hay ventana**: se trae el último valor real de cada ONU y se
+informa su antigüedad en `status_timestamp` / `los_timestamp`, para que el
+consumidor decida si le sirve. Acotar con `horas` solo descarta datos viejos, no
+acelera nada: la consulta ya entra por el índice `(itemid, clock)`.
+
+### Cómo se determina el estado
+
+**La mayoría de las ONUs no tiene el item `hwGponDeviceOntEthernetOnlineState`** —
+solo algunas plantillas de Zabbix lo incluyen. Por eso el estado se resuelve por
+precedencia, y cada dispositivo informa de dónde salió el suyo en
+`origen_estado`:
+
+| Precedencia | `origen_estado` | Criterio |
+|---|---|---|
+| 1 | `onlinestate` | Valor del item `OnlineState`. Autoritativo. |
+| 2 | `los` | Derivado de la alarma óptica: `LOS` → offline, `No Alarm` → online |
+| 3 | `null` | Sin ninguno de los dos items con lecturas → `sin_datos` |
+
+El resumen trae el desglose en `resumen.origen_estado`, que es la métrica para
+saber qué tan confiable es el resto de los números: si casi todo viene de `los`,
+estás mirando un proxy óptico, no el estado operativo real de la ONU.
+
+### Última causa de caída
+
+`ldc` y `ldc_timestamp` salen del item `hwGponDeviceOntControlLastDownCause`, que
+guarda causa y fecha en un solo string: `Dying-gasp-(2026-07-17 22:11:11)`. Se
+parte en la primera aparición de `-(`, así que una causa con guiones (`LOS-i`) no
+se corta mal.
+
+Es una consulta aparte de la de estado y LOS porque ese item es de **texto**: sus
+valores viven en `history_text`, no en `history_str`. Ambas corren en paralelo.
+
+La fecha embebida no trae zona horaria; se interpreta con la de la base
+(`current_setting('TimeZone')`) antes de convertirla a epoch. Si viniera
+malformada, `ldc_timestamp` queda en `null` y `ldc` igual se devuelve — un valor
+roto no tumba la consulta entera.
 
 ```bash
 curl -H "X-API-Key: $API_KEY" "http://localhost:8000/api/v1/empresa/2/analytics?limit=100"

@@ -51,8 +51,15 @@ ORDER BY b.id
 """
 
 # --- Paso 3: PostgreSQL zabbix ------------------------------------------------
-# Params  : (lista_de_precintos, desde_epoch)
+# Params  : (lista_de_precintos, desde_epoch, desde_epoch)
+#           desde_epoch = 0 desactiva el filtro temporal (mismo patrón de flag
+#           que usa la consulta de soldef).
 # Columnas: precinto, metrica ('status' | 'los'), valor, clock
+#
+# El filtro de tiempo es opcional porque ya no hace falta para el rendimiento:
+# al estar acotada por itemid, `DISTINCT ON (itemid) ORDER BY itemid, clock DESC`
+# entra por el índice (itemid, clock) y trae el último valor sin recorrer todo.
+# Con ventana fija se perdían ONUs cuyo último dato era más viejo que la ventana.
 #
 # El precinto viaja embebido en items.name, entre 'descr_' y '_odb':
 #   (WESTNET) 302381 - LAURA MARCELA DIAZ_zone_CIUDAD_descr_WN12753_odb_GLL-...
@@ -91,8 +98,58 @@ SELECT DISTINCT ON (im.itemid)
 FROM precintos p
 INNER JOIN items_metrica im ON im.precinto = p.precinto
 INNER JOIN history_str hs ON hs.itemid = im.itemid
-WHERE hs.clock >= %s
+WHERE (%s = 0 OR hs.clock >= %s)
 ORDER BY im.itemid, hs.clock DESC
+"""
+
+
+# --- Paso 3b: última causa de caída (LastDownCause) ---------------------------
+# Params  : (lista_de_precintos, desde_epoch, desde_epoch)
+# Columnas: precinto, ldc, ldc_timestamp, clock
+#
+# Va aparte de Q_ZBX_METRICAS porque hwGponDeviceOntControlLastDownCause es un
+# item de TEXTO: sus valores viven en history_text, no en history_str.
+#
+# El valor llega como 'Dying-gasp-(2026-07-17 22:11:11)' y se parte en dos con el
+# mismo criterio que usa queries/precinto.py: la causa antes de '-(' y la fecha
+# adentro del paréntesis. Esa fecha no trae zona horaria, así que se interpreta
+# con la de la base (current_setting('TimeZone')) y no como UTC, que correría el
+# epoch varias horas.
+#
+# El CASE evita que un valor con fecha malformada aborte toda la consulta: en ese
+# caso devuelve la causa con ldc_timestamp en NULL en vez de fallar.
+Q_ZBX_LDC = """
+WITH precintos AS (
+    SELECT DISTINCT upper(trim(regexp_replace(t.p, '\\s+', ' ', 'g'))) AS precinto
+    FROM unnest(%s::text[]) AS t(p)
+),
+items_ldc AS (
+    SELECT i.itemid,
+           upper(trim(regexp_replace(replace(split_part(split_part(i.name, 'descr_', 2), '_odb', 1), '_', ' '), '\\s+', ' ', 'g'))) AS precinto
+    FROM items i
+    INNER JOIN hosts h ON h.hostid = i.hostid
+    WHERE i.key_ LIKE '%%hwGponDeviceOntControlLastDownCause%%'
+      AND i.status = 0
+      AND h.status = 0
+      AND i.name LIKE '%%descr\\_%%'
+)
+SELECT DISTINCT ON (im.itemid)
+    im.precinto,
+    split_part(ht.value, '-(', 1) AS ldc,
+    CASE WHEN replace(split_part(ht.value, '-(', 2), ')', '')
+              ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}$'
+         THEN extract(epoch FROM (
+                  replace(split_part(ht.value, '-(', 2), ')', '')::timestamp
+                  AT TIME ZONE current_setting('TimeZone')))::bigint
+    END AS ldc_timestamp,
+    ht.clock AS clock
+FROM precintos p
+INNER JOIN items_ldc im ON im.precinto = p.precinto
+INNER JOIN history_text ht ON ht.itemid = im.itemid
+WHERE (%s = 0 OR ht.clock >= %s)
+  AND replace(split_part(ht.value, '-(', 2), ')', '') <> ''
+  AND split_part(ht.value, '-(', 1) <> 'Query-fails'
+ORDER BY im.itemid, ht.clock DESC
 """
 
 
@@ -100,6 +157,7 @@ _REQUERIDAS = {
     "Q_NAPEAR_ONTS_POR_EMPRESA": "napear",
     "Q_SOLDEF_ONUS_POR_IDS": "soldef",
     "Q_ZBX_METRICAS": "zabbix",
+    "Q_ZBX_LDC": "zabbix",
 }
 
 

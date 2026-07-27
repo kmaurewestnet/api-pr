@@ -5,9 +5,11 @@ from pydantic import BaseModel, Field
 
 
 class RangoTiempo(BaseModel):
-    desde_timestamp: int
+    desde_timestamp: Optional[int] = Field(
+        default=None, description="null cuando no se acotó la antigüedad"
+    )
     hasta_timestamp: int
-    horas_consultadas: int
+    horas_consultadas: Optional[int] = None
 
 
 class Paginacion(BaseModel):
@@ -26,13 +28,20 @@ class Metadata(BaseModel):
     paginacion: Optional[Paginacion] = None
 
 
+class OrigenEstado(BaseModel):
+    onlinestate: int = Field(description="Estado tomado del item OnlineState")
+    los: int = Field(description="Estado derivado de la alarma LOS")
+    sin_datos: int
+
+
 class Resumen(BaseModel):
     total: int
     online: int
     offline: int
-    sin_datos: int = Field(description="Sin lecturas en Zabbix dentro de la ventana")
+    sin_datos: int = Field(description="Sin item de estado ni de LOS con lecturas")
     con_alarma_los: int
     porcentaje_online: Optional[float] = None
+    origen_estado: OrigenEstado
 
 
 class Dispositivo(BaseModel):
@@ -50,7 +59,20 @@ class Dispositivo(BaseModel):
     status_timestamp: Optional[int] = None
     los: Optional[str] = None
     los_timestamp: Optional[int] = None
+    ldc: Optional[str] = Field(
+        default=None, description="Última causa de caída, ej. 'Dying-gasp'"
+    )
+    ldc_timestamp: Optional[int] = Field(
+        default=None,
+        description="Epoch del momento de la caída, parseado del propio valor. "
+                    "null si la fecha embebida viene malformada.",
+    )
     estado: str = Field(description="online | offline | sin_datos")
+    origen_estado: Optional[str] = Field(
+        default=None,
+        description="De dónde salió 'estado': 'onlinestate' (item autoritativo) o "
+                    "'los' (derivado de la alarma óptica). null si es sin_datos.",
+    )
     con_los: bool
 
 
