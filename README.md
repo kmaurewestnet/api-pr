@@ -1,0 +1,132 @@
+# Zabbix Precintos API
+
+API HTTP de consulta sobre ONUs. Dos endpoints:
+
+| Endpoint | Qué responde | Bases |
+|---|---|---|
+| `GET /api/v1/precinto/{codigo_precinto}` | Series históricas de una ONU: RX, OLT RX, logs y estados | zabbix |
+| `GET /api/v1/empresa/{empresa_id}/analytics` | Estado del parque completo de una empresa | napear + soldef + zabbix |
+| `GET /health` | Conectividad de cada base por separado | las 3 |
+
+Todos requieren la cabecera `X-API-Key`.
+
+## Puesta en marcha
+
+```bash
+pip install -r requirements.txt
+```
+
+Copiar `.env.example` a `.env` y completar. Las variables de zabbix (`DB_HOST`,
+`DB_NAME`, `DB_USER`, `DB_PASS`) conservan los nombres originales.
+
+```bash
+uvicorn main:app --host 0.0.0.0 --port 8000
+```
+
+Los pools de conexión se crean al primer uso de cada base, no al arrancar: si
+faltan las credenciales de soldef o napear, la API igual levanta y el endpoint
+de precinto sigue funcionando. `/health` reporta cuál falla.
+
+## Endpoint de analíticas
+
+```
+GET /api/v1/empresa/{empresa_id}/analytics
+```
+
+| Parámetro | Default | Rango | Uso |
+|---|---|---|---|
+| `horas` | 168 (7 días) | 1–720 | ventana para buscar el último estado y LOS en Zabbix |
+| `page` | 1 | ≥1 | página del listado |
+| `limit` | 500 | 1–5000 | tamaño de página |
+| `full` | false | | devuelve todo por streaming, ignorando `page`/`limit` |
+| `estado` | — | `online`\|`offline`\|`sin_datos`\|`los` | filtra el listado; el resumen siempre se calcula sobre el total |
+
+El default de `horas` son 7 días y no 6 horas porque el estado operativo en
+Zabbix solo se escribe cuando cambia: con una ventana corta la mayoría de las
+ONUs sanas quedarían en `sin_datos`.
+
+```bash
+curl -H "X-API-Key: $API_KEY" "http://localhost:8000/api/v1/empresa/2/analytics?limit=100"
+```
+
+### Cadena de identificadores
+
+```
+napear.registros.empresa_id
+  -> registro_reservas.external_connector_id      ("serial")
+  -> soldef.dispositivos_bocas.id
+  -> soldef.dispositivos_precintos.etiqueta       ("precinto")
+  -> zabbix: items.name, que trae el precinto entre 'descr_' y '_odb'
+```
+
+El precinto es la clave de cruce contra Zabbix porque viaja embebido en el
+nombre del item:
+
+```
+(WESTNET) 302381 - LAURA MARCELA DIAZ_zone_CIUDAD_descr_WN12753_odb_GLL-2763_authd_20260727
+                                                        ^^^^^^^ precinto
+```
+
+Se extrae con `replace(split_part(split_part(i.name,'descr_',2),'_odb',1),'_',' ')`,
+la misma expresión que usa el endpoint de precinto. El `replace('_',' ')` final
+es el que convierte `descr_PR_W3165_odb` en `PR W3165`, que es exactamente el
+formato en que soldef devuelve el precinto.
+
+La MAC (derivada de `dispositivos.nro_serie` traduciendo el prefijo de fabricante
+a hexadecimal: `HWTC` → `48575443`, `ZTEG` → `5A544547`, …) se sigue devolviendo
+en la respuesta, pero **no participa del cruce**.
+
+Como son tres motores distintos, el merge final se hace en memoria indexando por
+precinto normalizado. La normalización (`upper` + `trim` + colapsar espacios) se
+aplica igual en SQL y en Python: si divergieran, la query devolvería filas que
+después no se encontrarían en el índice.
+
+`nombre` sale del `nap_tag` de napear — es el único campo con forma de nombre en
+toda la cadena; soldef no devuelve uno.
+
+## Rendimiento
+
+La consulta a Zabbix separa dos cosas de naturaleza distinta:
+
+| | Qué hace | Cuánto cambia | Costo |
+|---|---|---|---|
+| CTE `items_metrica` | Resolver identidad: precinto → itemid | Solo al provisionar o mover una ONT | Un escaneo de `items` |
+| `JOIN history_str` | Leer el último valor | Constantemente | Índice `(itemid, clock)` |
+
+La versión original resolvía la identidad cruzando la MAC contra
+`history_text.value` — una columna **sin índice**, en una tabla de millones de
+filas, escaneada entera en cada request y por cada métrica. Cruzar por precinto
+mueve esa resolución a `items`, que es chica y está indexada por `key_` y
+`hostid`, y deja el acceso a la historia por `itemid`, que entra por la PK.
+
+Dos consecuencias de diseño:
+
+1. **`QUERY_CHUNK_SIZE` está en 50000 a propósito.** El escaneo de `items` se
+   repite por lote, así que conviene que una empresa grande entre en uno solo.
+2. **Estado y LOS van en una sola consulta**, no en dos paralelas: ambas
+   comparten la resolución precinto → itemid, así que hacerlas por separado
+   duplicaba el trabajo sin ganar nada.
+
+No hace falta ningún índice nuevo, ni tabla materializada, ni cache: la API tiene
+solo lectura sobre Zabbix y una ONT recién provisionada aparece en la siguiente
+consulta.
+
+`STATEMENT_TIMEOUT_MS` (default 120000) corta una consulta colgada en vez de
+dejar la conexión tomada. El log de cada request incluye el tiempo por paso:
+
+```
+empresa=2 seriales=12345 onus=12000 precintos=11987 | napear=0.31s soldef=1.20s zabbix=2.44s total=4.02s
+```
+
+## Estructura
+
+```
+config.py             DSNs de las 3 bases, API key, logging, límites
+db.py                 pools de conexión + context managers
+security.py           validación de X-API-Key
+models.py             modelos de respuesta (documentan /docs)
+queries/precinto.py   las 4 consultas del endpoint de precinto
+queries/analytics.py  las 3 consultas del cruce entre bases
+services/analytics.py orquestación de los 3 pasos, cruce y agregados
+routers/              un módulo por endpoint
+```

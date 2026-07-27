@@ -1,0 +1,118 @@
+NAPEAR:
+ "SELECT r.empresa_id, e.nombre as empresa, rr.nap_tag, rr.external_connector_id as serial
+                    FROM registros r
+                    INNER JOIN registro_reservas rr ON r.id = rr.registro_id
+                    INNER JOIN empresas e ON r.empresa_id = e.id
+                    INNER JOIN installation_sheets i ON r.id = i.reservation
+                    WHERE 
+                    r.empresa_id = 2 #ID de empresa
+                    AND r.estado_id = 3
+                    AND rr.external_connector_id IS NOT NULL
+                    ORDER BY r.id"
+	Respuesta:
+		empresa_id, empresa, nap_tag, serial
+		2,Bigway,AG-005,2453479
+		2,Bigway,AG-005,2480144
+		2,Bigway,AG-005,2515253
+
+SOLDEF:
+ "SELECT
+b.id as serial,
+p.etiqueta as precinto,
+replace(replace(replace(replace(replace(replace(replace(replace(replace(d.nro_serie, 'HWTC', '48575443'), 'ZTEG', '5A544547'), 'VSOL', '56534F4C'), 'RTEG', '52544547'), 'TPLG', '54504C47'), 'NBEL', '4E42454C'), 'MSTC', '4D535443'), 'GPON', '47504F4E'), 'ASKY', '41534B59') as mac
+FROM dispositivos_bocas b
+INNER JOIN dispositivos_onuses o ON b.onu_id = o.id
+LEFT JOIN dispositivos_precintos p ON b.precinto_id = p.id
+INNER JOIN dispositivos d ON o.dispositivo_id = d.id
+WHERE (%s = 0) OR (b.id = ANY(%s))
+ORDER BY b.id"
+
+	RESPUESTA:
+		serial,precinto,mac
+		2413636,PR W3165,48575443BB83EDAD
+		2426072,PR WA3836,5A544547D6D0D094
+		2456883,WA18289,48575443AF38233A
+
+ZABBIX:
+
+LOS:
+"WITH input_macs AS (
+    -- Reemplaza con tu lista de MACs
+    SELECT unnest(ARRAY['54504C47B76EF250', '54504C47B76EAD60', '485754434EB78078', '54504C47B71CF9B0']::text[]) AS mac
+),
+mac_items AS (
+    SELECT DISTINCT ON (m.mac)
+        m.mac,
+        i.hostid,
+        replace(replace(i.name, 'ONU Serial ', ''), ' ', '') AS ont_id
+    FROM input_macs m
+    INNER JOIN history_text g ON g.value = m.mac
+    INNER JOIN items i ON i.itemid = g.itemid
+    INNER JOIN hosts h ON i.hostid = h.hostid
+    WHERE i.key_ LIKE '%hwGponDeviceOntSn%'
+      AND i.status = 0
+      AND h.status = 0
+      AND g.clock >= extract(epoch FROM now() - interval '30 days')::int
+    ORDER BY m.mac, g.clock DESC
+),
+status_items AS (
+    SELECT 
+        m.mac,
+        m.ont_id,
+        i_stat.itemid AS status_itemid
+    FROM mac_items m
+    INNER JOIN items i_stat ON i_stat.hostid = m.hostid
+    WHERE i_stat.key_ LIKE '%hwGponDeviceOntAlarmLOSi%'
+      AND i_stat.status = 0
+      AND replace(replace(i_stat.name, 'ONU LOSi ', ''), ' ', '') = m.ont_id
+)
+SELECT DISTINCT ON (s.status_itemid)
+    s.mac,
+    hs.value AS log,
+    to_timestamp(hs.clock) AS time
+FROM status_items s
+INNER JOIN history_str hs ON hs.itemid = s.status_itemid
+WHERE hs.clock >= extract(epoch FROM now() - interval '30 days')::int
+ORDER BY s.status_itemid, hs.clock DESC;
+"
+
+
+ONLINE/OFFLINE:
+"WITH input_macs AS (
+    -- Reemplaza con tu lista de MACs
+    SELECT unnest(ARRAY['54504C47B76EF250', '54504C47B76EAD60', '485754434EB78078', '54504C47B71CF9B0']::text[]) AS mac
+),
+mac_items AS (
+    SELECT DISTINCT ON (m.mac)
+        m.mac,
+        i.hostid,
+        replace(replace(i.name, 'ONU Serial ', ''), ' ', '') AS ont_id
+    FROM input_macs m
+    INNER JOIN history_text g ON g.value = m.mac
+    INNER JOIN items i ON i.itemid = g.itemid
+    INNER JOIN hosts h ON i.hostid = h.hostid
+    WHERE i.key_ LIKE '%hwGponDeviceOntSn%'
+      AND i.status = 0
+      AND h.status = 0
+      AND g.clock >= extract(epoch FROM now() - interval '30 days')::int
+    ORDER BY m.mac, g.clock DESC
+),
+status_items AS (
+    SELECT 
+        m.mac,
+        m.ont_id,
+        i_stat.itemid AS status_itemid
+    FROM mac_items m
+    INNER JOIN items i_stat ON i_stat.hostid = m.hostid
+    WHERE i_stat.key_ LIKE '%OnlineState%'
+      AND i_stat.status = 0
+      AND replace(replace(i_stat.name, 'ONU Status ', ''), ' ', '') = m.ont_id
+)
+SELECT DISTINCT ON (s.status_itemid)
+    s.mac,
+    hs.value AS log,
+    to_timestamp(hs.clock) AS time
+FROM status_items s
+INNER JOIN history_str hs ON hs.itemid = s.status_itemid
+WHERE hs.clock >= extract(epoch FROM now() - interval '7 days')::int
+ORDER BY s.status_itemid, hs.clock DESC;"
