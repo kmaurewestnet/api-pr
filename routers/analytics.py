@@ -15,15 +15,14 @@ log = logging.getLogger(__name__)
 
 router = APIRouter(tags=["analiticas"], dependencies=[Depends(verificar_api_key)])
 
-ESTADOS = ("online", "offline", "sin_datos", "los")
+ESTADOS = svc.CATEGORIAS
 
 
 def _filtrar(dispositivos, estado):
+    """Filtra por categoría, la misma taxonomía excluyente que usa el resumen."""
     if not estado:
         return dispositivos
-    if estado == "los":
-        return [d for d in dispositivos if d["con_los"]]
-    return [d for d in dispositivos if d["estado"] == estado]
+    return [d for d in dispositivos if d["categoria"] == estado]
 
 
 def _stream(metadata, resumen, dispositivos):
@@ -61,8 +60,9 @@ def analiticas_empresa(
     ),
     estado: Optional[str] = Query(
         default=None,
-        description="Filtra el listado: online | offline | sin_datos | los. "
-                    "El resumen siempre se calcula sobre el total.",
+        description="Filtra el listado por categoría: online | offline | los | "
+                    "powerfail | sin_datos. El resumen siempre se calcula sobre "
+                    "el total, sin importar este filtro.",
     ),
 ):
     if estado and estado not in ESTADOS:

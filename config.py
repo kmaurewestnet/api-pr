@@ -73,6 +73,16 @@ def nap_dsn() -> dict:
 
 # --- Límites de las consultas pesadas ---
 
+# --- Clasificación de las caídas ---
+
+# Un Dying-gasp dentro de esta ventana respecto del momento de la caída se
+# interpreta como corte de energía. Tiene que absorber el desfase entre cuándo la
+# ONT reportó el evento y cuándo Zabbix lo registró (intervalo de sondeo).
+VENTANA_POWERFAIL_SEG = _int("VENTANA_POWERFAIL_SEG", 900)
+# Una alarma LOS más vieja que esto se considera vencida: el equipo cuenta como
+# offline común en vez de como corte de fibra vigente.
+LOS_VIGENTE_SEG = _int("LOS_VIGENTE_DIAS", 7) * 86400
+
 # Tamaño de lote al cruzar listas grandes de precintos contra Zabbix.
 # Alto a propósito: el escaneo de `items` se repite entero en cada lote, así que
 # conviene que una empresa grande entre en uno solo.

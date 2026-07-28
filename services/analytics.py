@@ -177,9 +177,44 @@ def _tiene_los(valor) -> bool:
     return "no alarm" not in texto and "los" in texto
 
 
-def cruzar(onus, metricas, nap_tags):
+def _es_dying_gasp(causa) -> bool:
+    """La ONT avisó que se quedaba sin energía justo antes de morir."""
+    return bool(causa) and "dying" in str(causa).lower()
+
+
+def _categoria(estado, con_los, los_ts, ldc, ldc_ts, caida_ts, ahora):
+    """Reparto excluyente: cada equipo cae en una sola categoría.
+
+    El orden importa. Powerfail se evalúa ANTES que LOS porque un corte de
+    energía apaga la ONT y eso genera LOS en la OLT: las dos señales aparecen
+    juntas, y el dying-gasp es la más específica. Si LOS ganara, no se
+    detectaría ningún powerfail.
+    """
+    if estado == "online":
+        return "online"
+    if estado == "sin_datos":
+        return "sin_datos"
+
+    # Caída. La cercanía se mide contra el momento de la caída, no contra ahora.
+    if (
+        _es_dying_gasp(ldc)
+        and ldc_ts
+        and caida_ts
+        and abs(caida_ts - ldc_ts) <= config.VENTANA_POWERFAIL_SEG
+    ):
+        return "powerfail"
+
+    # Una alarma LOS vencida ya no describe la caída actual.
+    if con_los and los_ts and (ahora - los_ts) < config.LOS_VIGENTE_SEG:
+        return "los"
+
+    return "offline"
+
+
+def cruzar(onus, metricas, nap_tags, ahora=None):
     """Une cada ONU de soldef con sus métricas de zabbix. Devuelve la lista completa."""
     status, los, ldc = metricas["status"], metricas["los"], metricas["ldc"]
+    ahora = ahora if ahora is not None else int(time.time())
     dispositivos = []
 
     for onu in onus:
@@ -201,6 +236,17 @@ def cruzar(onus, metricas, nap_tags):
         else:
             estado, origen = "sin_datos", None
 
+        # Momento de la caída: el registro del estado si existe, y si no el de la
+        # alarma, que es de donde se dedujo que el equipo está caído.
+        caida_ts = st_v[1] if st_v else (los_v[1] if los_v else None)
+        categoria = _categoria(
+            estado, con_los,
+            los_v[1] if los_v else None,
+            ldc_v[0] if ldc_v else None,
+            ldc_v[1] if ldc_v else None,
+            caida_ts, ahora,
+        )
+
         dispositivos.append(
             {
                 "serial": serial,
@@ -215,38 +261,35 @@ def cruzar(onus, metricas, nap_tags):
                 "ldc_timestamp": ldc_v[1] if ldc_v else None,
                 "estado": estado,
                 "origen_estado": origen,
+                "categoria": categoria,
                 "con_los": con_los,
             }
         )
     return dispositivos
 
 
+CATEGORIAS = ("online", "offline", "los", "powerfail", "sin_datos")
+
+
 def resumir(dispositivos):
-    """Agregados calculados en un solo pase sobre la lista."""
-    online = offline = sin_datos = con_los = 0
+    """Reparto excluyente por categoría, en un solo pase.
+
+    Los cinco contadores suman el total: cada equipo está en uno y solo uno.
+    """
+    conteo = {c: 0 for c in CATEGORIAS}
     # Cuántos estados salen del item autoritativo y cuántos del proxy de LOS:
-    # sirve para saber qué tan confiable es el resumen.
+    # una categoría derivada de un proxy vale menos que una tomada del item real.
     origenes = {"onlinestate": 0, "los": 0, "sin_datos": 0}
 
     for d in dispositivos:
-        if d["estado"] == "online":
-            online += 1
-        elif d["estado"] == "offline":
-            offline += 1
-        else:
-            sin_datos += 1
-        if d["con_los"]:
-            con_los += 1
+        conteo[d["categoria"]] += 1
         origenes[d["origen_estado"] or "sin_datos"] += 1
 
     total = len(dispositivos)
     return {
         "total": total,
-        "online": online,
-        "offline": offline,
-        "sin_datos": sin_datos,
-        "con_alarma_los": con_los,
-        "porcentaje_online": round(100 * online / total, 2) if total else None,
+        **conteo,
+        "porcentaje_online": round(100 * conteo["online"] / total, 2) if total else None,
         "origen_estado": origenes,
     }
 

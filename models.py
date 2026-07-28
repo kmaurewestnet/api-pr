@@ -35,11 +35,16 @@ class OrigenEstado(BaseModel):
 
 
 class Resumen(BaseModel):
+    """Reparto excluyente: los cinco contadores suman `total`."""
+
     total: int
     online: int
-    offline: int
+    offline: int = Field(description="Caída sin dying-gasp reciente ni LOS vigente")
+    los: int = Field(description="Caída con alarma óptica de menos de 7 días")
+    powerfail: int = Field(
+        description="Caída con Dying-gasp a menos de 15 min del corte"
+    )
     sin_datos: int = Field(description="Sin item de estado ni de LOS con lecturas")
-    con_alarma_los: int
     porcentaje_online: Optional[float] = None
     origen_estado: OrigenEstado
 
@@ -66,6 +71,9 @@ class Dispositivo(BaseModel):
         default=None,
         description="Epoch del momento de la caída, parseado del propio valor. "
                     "null si la fecha embebida viene malformada.",
+    )
+    categoria: str = Field(
+        description="Reparto excluyente: online | offline | los | powerfail | sin_datos"
     )
     estado: str = Field(description="online | offline | sin_datos")
     origen_estado: Optional[str] = Field(

@@ -63,6 +63,29 @@ El resumen trae el desglose en `resumen.origen_estado`, que es la métrica para
 saber qué tan confiable es el resto de los números: si casi todo viene de `los`,
 estás mirando un proxy óptico, no el estado operativo real de la ONU.
 
+### Categorías del resumen
+
+Sobre `estado` se construye un reparto **excluyente** en el campo `categoria`,
+que es lo que cuenta el resumen. Los cinco contadores suman `total`:
+
+| Orden | Condición | Categoría |
+|---|---|---|
+| 1 | Reporta `Online` | `online` |
+| 2 | Caída con `Dying-gasp` a menos de `VENTANA_POWERFAIL_SEG` (900 s) del corte | `powerfail` |
+| 3 | Caída con alarma LOS de menos de `LOS_VIGENTE_DIAS` (7) | `los` |
+| 4 | Caída (incluye LOS vencido) | `offline` |
+| 5 | Sin datos en Zabbix | `sin_datos` |
+
+`powerfail` va antes que `los` porque un corte de energía apaga la ONT y eso
+genera LOS en la OLT: las dos señales llegan juntas y el dying-gasp es la
+específica. Si LOS ganara, no se detectaría ningún powerfail.
+
+La cercanía del dying-gasp se mide contra el **momento de la caída**
+(`status_timestamp`, o `los_timestamp` si no hay item de estado), no contra
+ahora. Los 900 s tienen que absorber el desfase entre cuándo la ONT reportó el
+evento y cuándo Zabbix lo registró, que depende del intervalo de sondeo: si
+`powerfail` da 0 en todas las empresas, ese umbral quedó corto.
+
 ### Última causa de caída
 
 `ldc` y `ldc_timestamp` salen del item `hwGponDeviceOntControlLastDownCause`, que
