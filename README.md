@@ -39,7 +39,7 @@ GET /api/v1/empresa/{empresa_id}/analytics
 | `page` | 1 | ≥1 | página del listado |
 | `limit` | 500 | 1–5000 | tamaño de página |
 | `full` | false | | devuelve todo por streaming, ignorando `page`/`limit` |
-| `estado` | — | `online`\|`offline`\|`sin_datos`\|`los` | filtra el listado; el resumen siempre se calcula sobre el total |
+| `estado` | — | `online`\|`offline`\|`los`\|`powerfail`\|`sin_datos` | filtra el listado por categoría; el resumen siempre se calcula sobre el total |
 
 Por defecto **no hay ventana**: se trae el último valor real de cada ONU y se
 informa su antigüedad en `status_timestamp` / `los_timestamp`, para que el
