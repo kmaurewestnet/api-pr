@@ -20,13 +20,19 @@ ORDER BY time DESC;
 """
 
 # Se eliminó el filtro h.clock de LOGS y ESTADO
+#
+# El filtro de formato de la fecha no es cosmético: algunos equipos reportan el
+# centinela '0-00-00 00:00:00', que no es cadena vacía, pasaba el filtro anterior
+# y hacía que el casteo a timestamp abortara TODA la consulta. Una sola fila
+# corrupta dejaba al precinto sin ninguna de sus cuatro métricas (error 500).
+# El regex subsume el chequeo de vacío que había antes.
 QUERY_LOGS = """
 SELECT distinct on (h.value) split_part(h.value, '-(', 1) as log, replace(split_part(h.value, '-(', 2), ')', '')::timestamp AS time
 FROM hosts ho, items i, history_text h
 WHERE i.key_ ~* 'hwGponDeviceOntControlLastDownCause' AND
       replace(split_part(split_part(i.name, 'descr_', 2), '_odb', 1), '_', ' ') ~* %s AND
       ho.hostid = i.hostid AND i.itemid = h.itemid
-      and replace(split_part(h.value, '-(', 2), ')', '') !=''
+      and replace(split_part(h.value, '-(', 2), ')', '') ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}$'
       and split_part(h.value, '-(', 1) !='Query-fails'
 ORDER BY h.value, time DESC;
 """
