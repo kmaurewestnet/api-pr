@@ -35,8 +35,17 @@ import config
 import db
 from queries import cortes as q
 from services import red
+from services.cache import CacheTTL
 
 log = logging.getLogger(__name__)
+
+# Estado que es idéntico para todos los clientes de una misma caja. Ver
+# services/cache.py: lo que se cachea es el resultado final (el booleano de NAP,
+# el del ping), no las consultas intermedias, así que un hit ahorra el walk SNMP
+# entero. Nada por cliente entra acá.
+_zona = CacheTTL(
+    config.CACHE_ZONA_TTL_SEG, config.CACHE_MAX_ENTRADAS, nombre="zona"
+)
 
 
 class ClienteNoEncontrado(LookupError):
@@ -200,25 +209,51 @@ def _en_paralelo(tareas: dict) -> dict:
     if not tareas:
         return {}
     resultados = {}
+    sin_capacidad = None
     workers = min(len(tareas), config.CORTES_MAX_WORKERS)
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futuros = {pool.submit(fn): nombre for nombre, fn in tareas.items()}
         for futuro, nombre in futuros.items():
             try:
                 resultados[nombre] = futuro.result()
+            except db.PoolAgotado as e:
+                # No es "la red no contestó", es "no llegué a preguntar". Dejarlo
+                # como no evaluable haría que la API devolviera 200 con una
+                # respuesta calculada sobre datos que nunca se consultaron: bajo
+                # carga mentiría en silencio en vez de fallar. Corta el request.
+                sin_capacidad = sin_capacidad or e
+                resultados[nombre] = None
             except Exception as e:
                 log.warning("La verificación '%s' falló: %s", nombre, e)
                 resultados[nombre] = None
+    if sin_capacidad:
+        raise sin_capacidad
     return resultados
 
 
 # --- Acceso a datos -----------------------------------------------------------
 
-def _pg(conexion, sql, params):
+def _pg_multi(conexion, consultas):
+    """Varias consultas sobre UNA sola conexión. Devuelve una lista de filas por
+    consulta, en orden.
+
+    Cada tarea paralela que abría su propia conexión multiplicaba el consumo del
+    pool por request: el camino Solar tomaba 4 conexiones de zabbix a la vez, así
+    que con POOL_MAX=10 la tercera request simultánea ya se quedaba sin. Estas
+    consultas entran por índice sobre `items`; secuenciarlas cuesta milisegundos
+    frente a los segundos que tarda un ping.
+    """
+    resultados = []
     with conexion() as conn:
         with db.cursor_pg(conn, config.CORTES_STATEMENT_TIMEOUT_MS) as cur:
-            cur.execute(sql, params)
-            return cur.fetchall()
+            for sql, params in consultas:
+                cur.execute(sql, params)
+                resultados.append(cur.fetchall())
+    return resultados
+
+
+def _pg(conexion, sql, params):
+    return _pg_multi(conexion, [(sql, params)])[0]
 
 
 def _mysql(conexion, sql, params):
@@ -303,8 +338,8 @@ def _switch_del_nodo(olt_ip: str) -> dict | None:
     return {"nombre": fila.get("nombre"), "ip": red.ip_valida(fila.get("ip"))}
 
 
-def _ont_por_consulta(nro_cliente: str) -> bool | None:
-    """Caso A1: LOS y Online State desde el historial de Zabbix."""
+def _estado_por_consulta(nro_cliente: str) -> bool | None:
+    """Caso A1: estado de la ONT (LOS + Online State). Por cliente, sin caché."""
     filas = _pg(db.zabbix_conn, q.Q_ZBX_ESTADO_CLIENTE, (nro_cliente,))
     los = next((f["valor"] for f in filas if f["metrica"] == "los"), None)
     estado = next((f["valor"] for f in filas if f["metrica"] == "estado"), None)
@@ -312,56 +347,100 @@ def _ont_por_consulta(nro_cliente: str) -> bool | None:
 
 
 def _nap_por_consulta(nap: str) -> bool | None:
-    """Caso A1: corte de caja calculado sobre el último log de cada ONT."""
-    if not nap:
-        return None
+    """Caso A1: corte de caja sobre el último log de cada ONT de la NAP."""
     filas = _pg(db.zabbix_conn, q.Q_ZBX_ESTADO_NAP, (nap,))
     if not filas:
         log.info("La NAP %s no tiene ocupación declarada en nap_ocupacion", nap)
         return None
-    fila = filas[0]
-    return nap_caida(fila.get("clientes_caidos"), fila.get("total_clientes"))
+    return nap_caida(filas[0].get("clientes_caidos"), filas[0].get("total_clientes"))
 
 
-def _oids(sql, clave: str):
-    """OIDs de SNMP para un cliente o una NAP.
+def _oids_cliente_solar(nro_cliente: str) -> dict:
+    """Caso A2: OIDs de LOS y de OnlineState de ESTE cliente. Sin caché."""
+    r = _pg_multi(
+        db.zabbix_conn,
+        [
+            (q.Q_ZBX_OID_LOS_CLIENTE, (nro_cliente,)),
+            (q.Q_ZBX_OID_ONLINE_CLIENTE, (nro_cliente,)),
+        ],
+    )
+    return {
+        "oids_los": [f["oid"] for f in r[0] if f.get("oid")],
+        "oids_online": [f["oid"] for f in r[1] if f.get("oid")],
+    }
 
-    Sin clave no se consulta: `<expresión> = ''` matchearía todos los items
-    cuyo nombre no tenga NAP, y cada OID devuelto es un subproceso snmpget.
+
+def _nap_por_snmp(olt_ip: str, nap: str) -> bool | None:
+    """Caso A2: corte de caja preguntándole a la OLT en vivo.
+
+    Sin ocupación declarada el resultado queda en "no evaluable": no se usa la
+    cantidad de OIDs leídos como total, porque en una NAP de un solo cliente eso
+    convertiría cualquier caída individual en un corte de zona.
     """
-    if not clave:
-        return []
-    filas = _pg(db.zabbix_conn, sql, (clave,))
-    return [f["oid"] for f in filas if f.get("oid")]
+    r = _pg_multi(
+        db.zabbix_conn,
+        [(q.Q_ZBX_OIDS_LOS_NAP, (nap,)), (q.Q_ZBX_OCUPACION_NAP, (nap,))],
+    )
+    oids = [f["oid"] for f in r[0] if f.get("oid")]
+    ocupacion = r[1][0].get("total_clientes") if r[1] else None
+
+    leidos = _interpretar(
+        oids, _valores_snmp(olt_ip, oids), hay_los, "LOS NAP", olt_ip
+    )
+    if not leidos:
+        return None
+    if not ocupacion:
+        log.info("Sin ocupación declarada para la NAP %s: no se evalúa corte", nap)
+        return None
+    return nap_caida(sum(1 for e in leidos if e), ocupacion)
 
 
-def _ocupacion_nap(nap: str) -> int | None:
+def _estado_nap(olt_ip: str, nap: str, es_solar: bool) -> bool | None:
+    """Estado de la caja, cacheado: es la misma respuesta para todos sus
+    clientes, y durante un corte real llegan todos juntos. El caché envuelve el
+    resultado final, así que un hit ahorra también el walk SNMP."""
     if not nap:
         return None
-    filas = _pg(db.zabbix_conn, q.Q_ZBX_OCUPACION_NAP, (nap,))
-    return filas[0].get("total_clientes") if filas else None
+    return _zona.obtener(
+        ("nap", olt_ip, nap),
+        (lambda: _nap_por_snmp(olt_ip, nap)) if es_solar
+        else (lambda: _nap_por_consulta(nap)),
+    )
 
 
-def _leer_snmp(olt_ip: str, oids: list, interprete, metrica: str) -> list:
-    """snmpget en paralelo sobre una lista de OIDs, ya interpretados.
-
-    Devuelve solo los que se pudieron leer y traducir; los códigos desconocidos
-    quedan afuera en vez de contarse como alarma.
-    """
+def _valores_snmp(olt_ip: str, oids: list) -> dict:
+    """{oid: valor crudo} leyendo todos los OIDs en la menor cantidad de
+    invocaciones posible: un snmpget por lote de SNMP_OIDS_POR_CONSULTA."""
     oids = (oids or [])[: config.CORTES_MAX_OIDS_NAP]
     if not olt_ip or not oids:
-        return []
-    valores = _en_paralelo(
-        {oid: partial(red.snmpget, olt_ip, oid) for oid in oids}
+        return {}
+    tamano = max(1, config.SNMP_OIDS_POR_CONSULTA)
+    lotes = [oids[i : i + tamano] for i in range(0, len(oids), tamano)]
+    respuestas = _en_paralelo(
+        {i: partial(red.snmpget, olt_ip, lote) for i, lote in enumerate(lotes)}
     )
-    lecturas = [(oid, v, interprete(v)) for oid, v in valores.items()]
+    valores = {}
+    for parcial in respuestas.values():
+        valores.update(parcial or {})
+    return valores
+
+
+def _interpretar(oids, valores, interprete, metrica, olt_ip) -> list:
+    """Traduce los valores crudos y loguea el par valor→interpretación.
+
+    Ese log es la única forma de ver si la OLT contesta lo que el intérprete cree
+    que contesta: es lo que destapó que el código 1 ('No Alarm') se estaba
+    leyendo como alarma. Los códigos desconocidos quedan afuera de la lista, no
+    se cuentan como positivos.
+    """
+    if not oids:
+        return []
+    lecturas = [(o, valores.get(o), interprete(valores.get(o))) for o in oids]
     leidos = [e for _, _, e in lecturas if e is not None]
-    # Valor crudo junto a su interpretación: es la única forma de ver desde el
-    # log si la OLT contesta lo que el intérprete cree que contesta.
     log.info(
         "snmp %s %s: %d/%d OIDs interpretados, %d positivos | %s",
         olt_ip, metrica, len(leidos), len(oids), sum(1 for e in leidos if e),
-        "; ".join(f"{oid}={v!r}->{e}" for oid, v, e in lecturas[:6]),
+        "; ".join(f"{o}={v!r}->{e}" for o, v, e in lecturas[:6]),
     )
     return leidos
 
@@ -369,33 +448,25 @@ def _leer_snmp(olt_ip: str, oids: list, interprete, metrica: str) -> list:
 def _ont_por_snmp(olt_ip: str, oids_los: list, oids_online: list) -> bool | None:
     """Caso A2: estado de la ONT preguntándole a la OLT en vivo.
 
-    Combina las dos señales igual que _ont_por_consulta —una en alarma alcanza
-    para dar la ONT por caída—, ahora que el documento actualizado provee la
-    consulta de OIDs de OnlineState además de la de LOS.
+    Los OIDs de LOS y de OnlineState van en la MISMA invocación: son pocos, del
+    mismo host, y ahora que el estado de la NAP está cacheado esta es la única
+    consulta SNMP que queda sin cachear en cada request.
+
+    Combina las dos señales igual que el caso A1: una en alarma alcanza para dar
+    la ONT por caída.
     """
+    oids_los = list(oids_los or [])
+    oids_online = list(oids_online or [])
+    valores = _valores_snmp(olt_ip, oids_los + oids_online)
     señales = [
-        any(lecturas)
-        for lecturas in (
-            _leer_snmp(olt_ip, oids_los, hay_los, "LOS"),
-            _leer_snmp(olt_ip, oids_online, esta_offline, "OnlineState"),
+        any(leidos)
+        for leidos in (
+            _interpretar(oids_los, valores, hay_los, "LOS", olt_ip),
+            _interpretar(oids_online, valores, esta_offline, "OnlineState", olt_ip),
         )
-        if lecturas
+        if leidos
     ]
     return any(señales) if señales else None
-
-
-def _nap_por_snmp(olt_ip: str, oids: list, ocupacion) -> bool | None:
-    """Caso A2: corte de caja contando los LOS que devuelve la OLT contra la
-    ocupación declarada. Sin ocupación el resultado queda en 'no evaluable': no
-    se usa la cantidad de OIDs leídos como total, porque en una NAP de un solo
-    cliente eso convertiría cualquier caída individual en un corte de zona."""
-    leidos = _leer_snmp(olt_ip, oids, hay_los, "LOS NAP")
-    if not leidos:
-        return None
-    if not ocupacion:
-        log.info("Sin ocupación declarada para la NAP: no se evalúa corte de caja")
-        return None
-    return nap_caida(sum(1 for e in leidos if e), ocupacion)
 
 
 def _evaluar_ftth(nro_cliente: str, cliente: dict) -> dict:
@@ -409,31 +480,36 @@ def _evaluar_ftth(nro_cliente: str, cliente: dict) -> dict:
             nro_cliente,
         )
 
-    # Primera tanda: todo lo que solo depende de la topología ya resuelta.
+    # Primera tanda. Lo compartido por toda la caja va por caché; el ping al
+    # cliente y el estado de su ONT, no: son la respuesta puntual de este cliente.
     tareas = {
         "ping_cliente": partial(red.ping, cliente["ip"], "cliente"),
-        "ping_olt": partial(red.ping, olt_ip, "olt"),
-        "switch": partial(_switch_del_nodo, olt_ip),
+        "ping_olt": partial(
+            _zona.obtener, ("ping", olt_ip), partial(red.ping, olt_ip, "olt")
+        ),
+        "switch": partial(
+            _zona.obtener, ("switch", olt_ip), partial(_switch_del_nodo, olt_ip)
+        ),
+        "nap": partial(_estado_nap, olt_ip, nap, es_solar),
     }
     if es_solar:
-        tareas["oids_los"] = partial(_oids, q.Q_ZBX_OID_LOS_CLIENTE, nro_cliente)
-        tareas["oids_online"] = partial(_oids, q.Q_ZBX_OID_ONLINE_CLIENTE, nro_cliente)
-        tareas["oids_nap"] = partial(_oids, q.Q_ZBX_OIDS_LOS_NAP, nap or "")
-        tareas["ocupacion"] = partial(_ocupacion_nap, nap)
+        tareas["oids"] = partial(_oids_cliente_solar, nro_cliente)
     else:
-        tareas["ont"] = partial(_ont_por_consulta, nro_cliente)
-        tareas["nap"] = partial(_nap_por_consulta, nap)
+        tareas["ont"] = partial(_estado_por_consulta, nro_cliente)
     r = _en_paralelo(tareas)
 
     # Segunda tanda: lo que necesitaba el resultado de la primera.
     switch = r.get("switch") or {}
-    tareas2 = {"ping_switch": partial(red.ping, switch.get("ip"), "switch")}
-    if es_solar:
-        tareas2["ont"] = partial(
-            _ont_por_snmp, olt_ip, r.get("oids_los"), r.get("oids_online")
+    sw_ip = switch.get("ip")
+    tareas2 = {
+        "ping_switch": partial(
+            _zona.obtener, ("ping", sw_ip), partial(red.ping, sw_ip, "switch")
         )
-        tareas2["nap"] = partial(
-            _nap_por_snmp, olt_ip, r.get("oids_nap"), r.get("ocupacion")
+    }
+    if es_solar:
+        d = r.get("oids") or {}
+        tareas2["ont"] = partial(
+            _ont_por_snmp, olt_ip, d.get("oids_los"), d.get("oids_online")
         )
     r.update(_en_paralelo(tareas2))
 
@@ -479,11 +555,18 @@ def _evaluar_wireless(nro_cliente: str, cliente: dict) -> dict:
         log.warning("El cliente wireless %s no tiene IP en Gestión", nro_cliente)
     topo = _obligatoria("zabbix_wireless", _topologia_wireless, cliente["ip"])
 
+    # El AP y el RouterBoard son del nodo, no del cliente: mismo caché que fibra.
     r = _en_paralelo(
         {
             "ping_cliente": partial(red.ping, cliente["ip"], "cliente"),
-            "ping_ap": partial(red.ping, topo["ap_ip"], "ap"),
-            "ping_rb": partial(red.ping, topo["rb_ip"], "routerboard"),
+            "ping_ap": partial(
+                _zona.obtener, ("ping", topo["ap_ip"]),
+                partial(red.ping, topo["ap_ip"], "ap"),
+            ),
+            "ping_rb": partial(
+                _zona.obtener, ("ping", topo["rb_ip"]),
+                partial(red.ping, topo["rb_ip"], "routerboard"),
+            ),
         }
     )
     is_online, is_zone = decidir_wireless(

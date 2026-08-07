@@ -100,22 +100,37 @@ def ping(ip, etiqueta="") -> bool | None:
     return responde
 
 
-def snmpget(host, oid) -> str | None:
-    """Valor del OID en el host, o None si no se pudo leer.
+def snmpget(host, oids) -> dict:
+    """Lee varios OIDs del host en UNA sola invocación de snmpget.
+
+    Devuelve {oid: valor} solo con los que se pudieron leer; un OID sin dato
+    simplemente no aparece. `oids` tiene que entrar en un PDU: el que chunkea es
+    quien llama (services/cortes._leer_snmp, con SNMP_OIDS_POR_CONSULTA).
+
+    Antes era un subproceso por OID. Una NAP de 64 clientes hacía 64 fork+exec
+    y, con el pool de hilos en 6, tardaba hasta 11 rondas de timeout SNMP. En un
+    solo PDU son 64 varbinds y un subproceso.
 
     La comunidad sale de SNMP_COMMUNITY y nunca se loguea: los mensajes de error
     solo mencionan host y OID.
     """
     destino = ip_valida(host)
     if not destino:
-        return None
+        return {}
     if not config.SNMP_COMMUNITY:
         log.error("SNMP_COMMUNITY no está configurada: no se puede consultar %s", destino)
-        return None
-    oid = str(oid or "").strip()
-    if not _OID_VALIDO.match(oid):
-        log.warning("OID inválido o sin resolver, se omite: %r", oid)
-        return None
+        return {}
+
+    # Validación en la frontera: lo que no es un OID no llega al subproceso.
+    validos = []
+    for oid in oids or []:
+        limpio = str(oid or "").strip()
+        if _OID_VALIDO.match(limpio):
+            validos.append(limpio)
+        else:
+            log.warning("OID inválido o sin resolver, se omite: %r", oid)
+    if not validos:
+        return {}
 
     argv = [
         config.SNMPGET_PATH,
@@ -123,26 +138,47 @@ def snmpget(host, oid) -> str | None:
         "-c", config.SNMP_COMMUNITY,
         "-t", str(config.SNMP_TIMEOUT_SEG),
         "-r", str(config.SNMP_RETRIES),
-        "-Oqv",   # imprime solo el valor
+        # -Oq: sin el "= INTEGER:"; -On: OID numérico. Juntos dan "<oid> <valor>"
+        # por línea, así que el resultado se mapea por OID y no por posición: si
+        # la OLT omite o reordena un varbind, no se corren todos los valores.
+        "-Oqn",
         "-Ln",    # sin logging de net-snmp por stderr
         destino,
-        oid,
+        *validos,
     ]
     tope = config.SNMP_TIMEOUT_SEG * (config.SNMP_RETRIES + 1) + 2
-    res = _ejecutar(argv, tope, f"snmpget {destino} {oid}")
+    res = _ejecutar(argv, tope, f"snmpget {destino} ({len(validos)} OIDs)")
     if res is None:
-        return None
+        return {}
 
     codigo, salida = res
-    if codigo != 0 or not salida:
-        log.warning("snmpget sin respuesta de %s para %s", destino, oid)
-        return None
-    if any(m in salida.lower() for m in _SNMP_SIN_DATO):
-        log.warning("snmpget: %s no tiene el OID %s", destino, oid)
-        return None
-    valor = salida.strip('"')
-    log.debug("snmpget %s %s = %r", destino, oid, valor)
-    return valor
+    if codigo != 0 and not salida:
+        log.warning("snmpget sin respuesta de %s para %d OIDs", destino, len(validos))
+        return {}
+
+    # Índice por OID sin punto inicial: se pide "1.3.6..." y net-snmp responde
+    # ".1.3.6...".
+    pedidos = {o.lstrip("."): o for o in validos}
+    valores = {}
+    for linea in salida.splitlines():
+        partes = linea.strip().split(None, 1)
+        if len(partes) != 2:
+            continue
+        oid_crudo, valor = partes
+        oid = pedidos.get(oid_crudo.lstrip("."))
+        if oid is None:
+            continue
+        if any(m in valor.lower() for m in _SNMP_SIN_DATO):
+            log.warning("snmpget: %s no tiene el OID %s", destino, oid)
+            continue
+        valores[oid] = valor.strip().strip('"')
+
+    faltantes = len(validos) - len(valores)
+    if faltantes:
+        log.warning("snmpget %s: %d de %d OIDs sin valor utilizable",
+                    destino, faltantes, len(validos))
+    log.debug("snmpget %s -> %s", destino, valores)
+    return valores
 
 
 def utilidades_disponibles() -> dict:

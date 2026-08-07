@@ -16,6 +16,7 @@ import threading
 from contextlib import contextmanager
 
 import psycopg2
+import psycopg2.pool
 from psycopg2.extras import RealDictCursor
 from psycopg2.pool import ThreadedConnectionPool
 
@@ -89,10 +90,27 @@ def _pool(nombre: str):
 
 # --- Context managers ---
 
+class PoolAgotado(DatabaseUnavailable):
+    """Todas las conexiones del pool están en uso.
+
+    Hereda de DatabaseUnavailable a propósito: es un 503, no un "no se pudo
+    verificar". La diferencia importa —el problema es de capacidad propia, no de
+    la red que se está midiendo— pero la respuesta al cliente es la misma:
+    devolver un resultado calculado sobre datos que nunca se consultaron sería
+    inventarlo.
+    """
+
+
 @contextmanager
 def _conexion_pg(nombre: str):
     pool = _pool(nombre)
-    conn = pool.getconn()
+    try:
+        conn = pool.getconn()
+    except psycopg2.pool.PoolError as e:
+        log.error("Pool de %s agotado (POOL_MAX=%s): %s", nombre, config.POOL_MAX, e)
+        raise PoolAgotado(
+            f"Sin conexiones libres a '{nombre}' (POOL_MAX={config.POOL_MAX})"
+        ) from e
     try:
         yield conn
     finally:
@@ -127,7 +145,18 @@ def zabbix_wireless_conn():
 
 @contextmanager
 def _conexion_mysql(nombre: str):
-    conn = _pool(nombre).get_connection()
+    # Import diferido, igual que el de la fábrica: para cuando se llega acá el
+    # pool ya existe, así que mysql-connector está importado.
+    from mysql.connector.errors import PoolError
+
+    pool = _pool(nombre)
+    try:
+        conn = pool.get_connection()
+    except PoolError as e:
+        log.error("Pool de %s agotado (POOL_MAX=%s): %s", nombre, config.POOL_MAX, e)
+        raise PoolAgotado(
+            f"Sin conexiones libres a '{nombre}' (POOL_MAX={config.POOL_MAX})"
+        ) from e
     try:
         yield conn
     finally:
