@@ -62,9 +62,33 @@ def es_ftth(categoria_id) -> bool:
         return False
 
 
+def _codigo_snmp(texto, codigos_si, codigos_no, metrica) -> bool | None:
+    """Traduce el entero crudo de un snmpget a booleano.
+
+    Un código que no esté en ninguna de las dos listas queda en None y se
+    loguea con su valor. La regla anterior era `int(valor) != 0`, que daba
+    alarma para *cualquier* código no nulo: si la OLT contesta con un enum
+    (1 = normal, 2 = alarma, o al revés), toda ONT sana se reportaba caída y
+    de ahí la NAP entera. Un código desconocido tiene que degradar, no afirmar.
+    """
+    codigo = int(texto)
+    if codigo in codigos_si:
+        return True
+    if codigo in codigos_no:
+        return False
+    log.warning(
+        "Código SNMP %s sin traducir para %s: agregalo a SNMP_COD_* en el .env",
+        codigo, metrica,
+    )
+    return None
+
+
 def hay_los(valor) -> bool | None:
-    """Alarma óptica activa. Acepta el texto que guarda Zabbix ('LOS',
-    'No Alarm') y el entero que devuelve un snmpget directo (1 / 0)."""
+    """Alarma óptica activa.
+
+    Acepta el texto ya mapeado que guarda Zabbix en su historial ('LOS',
+    'No Alarm') y el entero crudo que devuelve un snmpget directo a la OLT.
+    """
     if valor is None:
         return None
     texto = str(valor).strip()
@@ -76,20 +100,28 @@ def hay_los(valor) -> bool | None:
     if "los" in bajo:
         return True
     if texto.lstrip("-").isdigit():
-        # Forma numérica del SNMP crudo: distinto de 0 es alarma activa.
-        return int(texto) != 0
+        return _codigo_snmp(texto, config.SNMP_COD_LOS, config.SNMP_COD_SIN_LOS, "LOS")
     return False
 
 
 def esta_offline(estado) -> bool | None:
-    """Item hwGponDeviceOntEthernetOnlineState. Mismo criterio que
-    services/analytics._es_online, invertido."""
+    """Item hwGponDeviceOntEthernetOnlineState, por historial o por SNMP crudo.
+    Mismo criterio que services/analytics._es_online, invertido."""
     if estado is None:
         return None
     texto = str(estado).strip()
     if not texto:
         return None
-    return "offline" in texto.lower()
+    bajo = texto.lower()
+    if "offline" in bajo:
+        return True
+    if "online" in bajo:
+        return False
+    if texto.lstrip("-").isdigit():
+        return _codigo_snmp(
+            texto, config.SNMP_COD_OFFLINE, config.SNMP_COD_ONLINE, "OnlineState"
+        )
+    return False
 
 
 def ont_caida(los, estado) -> bool | None:
@@ -310,22 +342,46 @@ def _ocupacion_nap(nap: str) -> int | None:
     return filas[0].get("total_clientes") if filas else None
 
 
-def _leer_los_snmp(olt_ip: str, oids: list) -> list:
-    """snmpget en paralelo sobre una lista de OIDs. Devuelve solo los que se
-    pudieron leer, como booleanos de 'tiene LOS'."""
+def _leer_snmp(olt_ip: str, oids: list, interprete, metrica: str) -> list:
+    """snmpget en paralelo sobre una lista de OIDs, ya interpretados.
+
+    Devuelve solo los que se pudieron leer y traducir; los códigos desconocidos
+    quedan afuera en vez de contarse como alarma.
+    """
     oids = (oids or [])[: config.CORTES_MAX_OIDS_NAP]
     if not olt_ip or not oids:
         return []
     valores = _en_paralelo(
         {oid: partial(red.snmpget, olt_ip, oid) for oid in oids}
     )
-    return [e for e in (hay_los(v) for v in valores.values()) if e is not None]
+    lecturas = [(oid, v, interprete(v)) for oid, v in valores.items()]
+    leidos = [e for _, _, e in lecturas if e is not None]
+    # Valor crudo junto a su interpretación: es la única forma de ver desde el
+    # log si la OLT contesta lo que el intérprete cree que contesta.
+    log.info(
+        "snmp %s %s: %d/%d OIDs interpretados, %d positivos | %s",
+        olt_ip, metrica, len(leidos), len(oids), sum(1 for e in leidos if e),
+        "; ".join(f"{oid}={v!r}->{e}" for oid, v, e in lecturas[:6]),
+    )
+    return leidos
 
 
-def _ont_por_snmp(olt_ip: str, oids: list) -> bool | None:
-    """Caso A2: estado de la ONT preguntándole a la OLT en vivo."""
-    leidos = _leer_los_snmp(olt_ip, oids)
-    return any(leidos) if leidos else None
+def _ont_por_snmp(olt_ip: str, oids_los: list, oids_online: list) -> bool | None:
+    """Caso A2: estado de la ONT preguntándole a la OLT en vivo.
+
+    Combina las dos señales igual que _ont_por_consulta —una en alarma alcanza
+    para dar la ONT por caída—, ahora que el documento actualizado provee la
+    consulta de OIDs de OnlineState además de la de LOS.
+    """
+    señales = [
+        any(lecturas)
+        for lecturas in (
+            _leer_snmp(olt_ip, oids_los, hay_los, "LOS"),
+            _leer_snmp(olt_ip, oids_online, esta_offline, "OnlineState"),
+        )
+        if lecturas
+    ]
+    return any(señales) if señales else None
 
 
 def _nap_por_snmp(olt_ip: str, oids: list, ocupacion) -> bool | None:
@@ -333,7 +389,7 @@ def _nap_por_snmp(olt_ip: str, oids: list, ocupacion) -> bool | None:
     ocupación declarada. Sin ocupación el resultado queda en 'no evaluable': no
     se usa la cantidad de OIDs leídos como total, porque en una NAP de un solo
     cliente eso convertiría cualquier caída individual en un corte de zona."""
-    leidos = _leer_los_snmp(olt_ip, oids)
+    leidos = _leer_snmp(olt_ip, oids, hay_los, "LOS NAP")
     if not leidos:
         return None
     if not ocupacion:
@@ -360,7 +416,8 @@ def _evaluar_ftth(nro_cliente: str, cliente: dict) -> dict:
         "switch": partial(_switch_del_nodo, olt_ip),
     }
     if es_solar:
-        tareas["oids_cliente"] = partial(_oids, q.Q_ZBX_OID_LOS_CLIENTE, nro_cliente)
+        tareas["oids_los"] = partial(_oids, q.Q_ZBX_OID_LOS_CLIENTE, nro_cliente)
+        tareas["oids_online"] = partial(_oids, q.Q_ZBX_OID_ONLINE_CLIENTE, nro_cliente)
         tareas["oids_nap"] = partial(_oids, q.Q_ZBX_OIDS_LOS_NAP, nap or "")
         tareas["ocupacion"] = partial(_ocupacion_nap, nap)
     else:
@@ -372,7 +429,9 @@ def _evaluar_ftth(nro_cliente: str, cliente: dict) -> dict:
     switch = r.get("switch") or {}
     tareas2 = {"ping_switch": partial(red.ping, switch.get("ip"), "switch")}
     if es_solar:
-        tareas2["ont"] = partial(_ont_por_snmp, olt_ip, r.get("oids_cliente"))
+        tareas2["ont"] = partial(
+            _ont_por_snmp, olt_ip, r.get("oids_los"), r.get("oids_online")
+        )
         tareas2["nap"] = partial(
             _nap_por_snmp, olt_ip, r.get("oids_nap"), r.get("ocupacion")
         )

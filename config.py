@@ -19,6 +19,22 @@ def _require(nombre: str) -> str:
     return valor
 
 
+def _codigos(nombre: str, default: str = "") -> frozenset:
+    """Lista de códigos SNMP enteros separados por coma."""
+    codigos = set()
+    for parte in os.getenv(nombre, default).split(","):
+        parte = parte.strip()
+        if not parte:
+            continue
+        try:
+            codigos.add(int(parte))
+        except ValueError:
+            raise ConfigError(
+                f"{nombre} debe ser una lista de enteros separados por coma"
+            )
+    return frozenset(codigos)
+
+
 def _int(nombre: str, default: int) -> int:
     try:
         return int(os.getenv(nombre, default))
@@ -155,6 +171,24 @@ SNMP_COMMUNITY = os.getenv("SNMP_COMMUNITY", "")
 SNMP_VERSION = os.getenv("SNMP_VERSION", "2c")
 SNMP_TIMEOUT_SEG = _int("SNMP_TIMEOUT_SEG", 3)
 SNMP_RETRIES = _int("SNMP_RETRIES", 1)
+
+# Traducción de los enteros que devuelve un snmpget crudo. Zabbix guarda en su
+# historial el texto ya mapeado ('LOS', 'No Alarm', 'Offline'), pero preguntarle
+# directo a la OLT devuelve el código numérico del MIB.
+#
+# Verificado contra las OLT del parque:
+#     hwGponDeviceOntAlarmLOSi            1 = No Alarm   2 = LOS / LOSi
+#     hwGponDeviceOntEthernetOnlineState  1 = Online     2 = Offline
+#
+# Solo hay que tocarlas si aparece una OLT de otro vendor. Un código que no esté
+# en ninguna de las dos listas de su métrica queda como "no evaluable" y se
+# loguea: nunca se asume alarma sobre un valor que no se sabe leer. La primera
+# versión traducía con `!= 0`, así que el 1 de "No Alarm" daba LOS y toda ONT
+# sana —y por arrastre su NAP entera— se reportaba caída.
+SNMP_COD_LOS = _codigos("SNMP_COD_LOS", "2")
+SNMP_COD_SIN_LOS = _codigos("SNMP_COD_SIN_LOS", "1")
+SNMP_COD_OFFLINE = _codigos("SNMP_COD_OFFLINE", "2")
+SNMP_COD_ONLINE = _codigos("SNMP_COD_ONLINE", "1")
 
 
 def setup_logging() -> None:

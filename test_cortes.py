@@ -44,17 +44,74 @@ def test_cliente_con_dos_tecnologias_resuelve_como_fibra():
 
 
 def test_hay_los():
-    # Texto que guarda Zabbix.
+    # Texto ya mapeado, tal como lo guarda Zabbix en su historial.
     assert svc.hay_los("LOS") is True
     assert svc.hay_los("los-i") is True
     assert svc.hay_los("No Alarm") is False
     assert svc.hay_los("Normal") is False
-    # Entero que devuelve un snmpget directo a la OLT.
-    assert svc.hay_los("1") is True
-    assert svc.hay_los("0") is False
     # Sin dato no es lo mismo que sin alarma.
     assert svc.hay_los(None) is None
     assert svc.hay_los("   ") is None
+
+
+def test_codigos_snmp_por_defecto():
+    """La regresion del cliente 88704: con `int(valor) != 0`, el codigo 1
+    ("No Alarm" / "Online") daba alarma, y por arrastre la NAP entera caida.
+
+    Estos son los valores verificados contra las OLT del parque, con los
+    defaults de config puestos: si alguien los invierte, esto falla."""
+    assert svc.hay_los("2") is True         # LOS / LOSi
+    assert svc.hay_los("1") is False        # No Alarm
+    assert svc.esta_offline("2") is True    # Offline
+    assert svc.esta_offline("1") is False   # Online
+
+
+def test_codigo_snmp_desconocido_no_es_alarma():
+    """La regresión que reporto produccion: con `int(valor) != 0`, un enum donde
+    el codigo normal es 1 o 2 daba alarma para toda ONT sana, y de ahi la NAP
+    entera se reportaba caida."""
+    los, sin_los = config.SNMP_COD_LOS, config.SNMP_COD_SIN_LOS
+    off, on = config.SNMP_COD_OFFLINE, config.SNMP_COD_ONLINE
+    try:
+        # Sin traduccion configurada: no se afirma nada.
+        config.SNMP_COD_LOS = config.SNMP_COD_SIN_LOS = frozenset()
+        assert svc.hay_los("1") is None
+        assert svc.hay_los("2") is None
+        assert svc.hay_los("0") is None
+
+        # Con la traduccion cargada, cada codigo cae donde corresponde.
+        config.SNMP_COD_LOS, config.SNMP_COD_SIN_LOS = frozenset({2}), frozenset({1})
+        assert svc.hay_los("2") is True
+        assert svc.hay_los("1") is False
+        assert svc.hay_los("7") is None      # codigo fuera de las dos listas
+
+        config.SNMP_COD_OFFLINE, config.SNMP_COD_ONLINE = frozenset({2}), frozenset({1})
+        assert svc.esta_offline("2") is True
+        assert svc.esta_offline("1") is False
+        assert svc.esta_offline("9") is None
+    finally:
+        config.SNMP_COD_LOS, config.SNMP_COD_SIN_LOS = los, sin_los
+        config.SNMP_COD_OFFLINE, config.SNMP_COD_ONLINE = off, on
+
+
+def test_ont_solar_combina_los_y_onlinestate():
+    """El documento actualizado agrega la consulta de OIDs de OnlineState: una
+    sola señal en alarma alcanza para dar la ONT por caida."""
+    lecturas = {}
+    original = svc._leer_snmp
+    svc._leer_snmp = lambda ip, oids, interprete, metrica: lecturas.get(metrica, [])
+    try:
+        lecturas = {"LOS": [False], "OnlineState": [False]}
+        assert svc._ont_por_snmp("10.0.0.1", ["1.1"], ["1.2"]) is False
+        lecturas = {"LOS": [False], "OnlineState": [True]}
+        assert svc._ont_por_snmp("10.0.0.1", ["1.1"], ["1.2"]) is True
+        lecturas = {"LOS": [True], "OnlineState": []}
+        assert svc._ont_por_snmp("10.0.0.1", ["1.1"], []) is True
+        # Ninguna de las dos se pudo interpretar: no evaluable, no "caida".
+        lecturas = {}
+        assert svc._ont_por_snmp("10.0.0.1", ["1.1"], ["1.2"]) is None
+    finally:
+        svc._leer_snmp = original
 
 
 def test_esta_offline():
@@ -177,6 +234,7 @@ def test_cantidad_de_parametros():
         "Q_ZBX_ESTADO_CLIENTE": 1,
         "Q_ZBX_ESTADO_NAP": 1,
         "Q_ZBX_OID_LOS_CLIENTE": 1,
+        "Q_ZBX_OID_ONLINE_CLIENTE": 1,
         "Q_ZBX_OIDS_LOS_NAP": 1,
         "Q_ZBX_OCUPACION_NAP": 1,
         "Q_ZBX_WIFI_AP": 1,

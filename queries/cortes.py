@@ -42,6 +42,17 @@ _MATCH_CODE = (
     "split_part(i.name, '_zone', 1) ~* ('(^|[^0-9])' || %s || '([^0-9]|$)')"
 )
 
+# En las OLT Solar el nombre del item tiene otro formato y el cliente hay que
+# sacarlo de después de 'ONU LOSi'. Es la expresión del documento actualizado; lo
+# único que se le cambió es el `~* '$code'` pelado por el mismo regex con
+# frontera de dígitos que usa _MATCH_CODE: con el match suelto, el cliente 8870
+# daba positivo contra los items del 88704.
+_MATCH_CODE_SOLAR = (
+    "replace(replace(replace(split_part(split_part(i.name,'ONU LOSi',2),"
+    "'_zone',1),'_',' '),'(',''),')','')"
+    " ~* ('(^|[^0-9])' || %s || '([^0-9]|$)')"
+)
+
 
 def _nap_normalizada(col: str) -> str:
     """Rellena con ceros la parte numérica de la NAP para poder compararla con
@@ -172,18 +183,37 @@ GROUP BY b.nap, b.clientes
 
 # --- Paso 3A2: OIDs para consulta en vivo (OLT Solar) -------------------------
 # Params  : (nro_cliente,)
-# Columnas: oid, olt_nombre
+# Columnas: nap_extraida, oid
 #
-# No está en el documento como query aparte: el documento dice "se extraen OID
-# del cliente" sin darla. Es la misma de la NAP filtrada por cliente.
+# Las dos consultas individuales por ONT del documento actualizado. Son la misma
+# salvo por `i.key_`, pero se dejan separadas porque cada una alimenta una señal
+# distinta de `ont_caida`, igual que en el caso A1.
+#
+# Se les agregó `i.snmp_oid IS NOT NULL`: sin OID no hay nada que preguntarle a
+# la OLT, y un NULL llegaría hasta el validador de OIDs para ser descartado ahí.
 Q_ZBX_OID_LOS_CLIENTE = f"""
-SELECT DISTINCT i.snmp_oid AS oid, h.host AS olt_nombre
+SELECT DISTINCT
+    {_NAP_EXTRAIDA} AS nap_extraida,
+    i.snmp_oid AS oid
 FROM items i
 JOIN hosts h ON i.hostid = h.hostid
 WHERE i.key_ ~* 'hwGponDeviceOntAlarmLOSi'
   AND h.name ~* 'Solar'
-  AND i.name !~* 'bigway'
-  AND {_MATCH_CODE}
+  AND {_MATCH_CODE_SOLAR}
+  AND i.snmp_oid IS NOT NULL
+"""
+
+# Params  : (nro_cliente,)
+# Columnas: nap_extraida, oid
+Q_ZBX_OID_ONLINE_CLIENTE = f"""
+SELECT DISTINCT
+    {_NAP_EXTRAIDA} AS nap_extraida,
+    i.snmp_oid AS oid
+FROM items i
+JOIN hosts h ON i.hostid = h.hostid
+WHERE i.key_ ~* 'hwGponDeviceOntEthernetOnlineState'
+  AND h.name ~* 'Solar'
+  AND {_MATCH_CODE_SOLAR}
   AND i.snmp_oid IS NOT NULL
 """
 

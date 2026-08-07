@@ -196,7 +196,39 @@ Gestión (MySQL): categoría + IP del cliente          -> isFtth
 ```
 
 La OLT se considera Solar cuando su `hosts.host` contiene "solar": esas no
-guardan historial utilizable y hay que preguntarles por SNMP en el momento.
+guardan historial utilizable y hay que preguntarles por SNMP en el momento. El
+nombre del item en esas OLT tiene otro formato, así que el cliente se extrae
+después de `'ONU LOSi'` y no con `split_part(i.name,'_zone',1)`.
+
+### Códigos SNMP: por qué hay que configurarlos
+
+Zabbix guarda en su historial el valor **ya mapeado** (`LOS`, `No Alarm`,
+`Offline`). Un `snmpget` directo a la OLT devuelve el **entero del MIB**. Las
+cuatro variables `SNMP_COD_*` hacen esa traducción, con estos defaults
+verificados contra las OLT del parque:
+
+| Item | Código | Significa | Variable |
+|---|---|---|---|
+| `hwGponDeviceOntAlarmLOSi` | `1` | No Alarm | `SNMP_COD_SIN_LOS` |
+| `hwGponDeviceOntAlarmLOSi` | `2` | LOS / LOSi | `SNMP_COD_LOS` |
+| `hwGponDeviceOntEthernetOnlineState` | `1` | Online | `SNMP_COD_ONLINE` |
+| `hwGponDeviceOntEthernetOnlineState` | `2` | Offline | `SNMP_COD_OFFLINE` |
+
+Solo hay que tocarlas si aparece una OLT de otro vendor. Un código que no esté en
+ninguna de las dos listas de su métrica queda en "no evaluable" y se loguea con
+su valor crudo: **nunca se asume alarma sobre un valor que no se sabe leer**.
+
+Eso último no es paranoia. La primera versión traducía con `int(valor) != 0`, o
+sea cualquier entero no nulo era alarma. Como el código normal es `1`, **toda ONT
+sana se reportaba caída**, y como los OIDs de la NAP entera daban lo mismo,
+`clientes_caidos == total_clientes` y la caja se declaraba en corte. Una ONT
+online con todos sus vecinos online devolvía `isZoneIncident: true`.
+
+El log muestra el valor crudo junto a su interpretación, sin `LOG_LEVEL=DEBUG`:
+
+```
+INFO [services.cortes] snmp 172.30.0.98 LOS: 8/8 OIDs interpretados, 0 positivos | 1.3.6...1='1'->False; ...
+```
 
 Las verificaciones del último paso corren en un `ThreadPoolExecutor`
 (`CORTES_MAX_WORKERS`, default 6). El endpoint se declara `def`, así que FastAPI

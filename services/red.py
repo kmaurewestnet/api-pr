@@ -140,7 +140,9 @@ def snmpget(host, oid) -> str | None:
     if any(m in salida.lower() for m in _SNMP_SIN_DATO):
         log.warning("snmpget: %s no tiene el OID %s", destino, oid)
         return None
-    return salida.strip('"')
+    valor = salida.strip('"')
+    log.debug("snmpget %s %s = %r", destino, oid, valor)
+    return valor
 
 
 def utilidades_disponibles() -> dict:
