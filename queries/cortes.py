@@ -54,6 +54,16 @@ _MATCH_CODE_SOLAR = (
 )
 
 
+# `~*` con un patrón sin metacaracteres es exactamente `ILIKE '%patrón%'`, pero
+# lo resuelve el motor de regex fila por fila. Sobre las ~156.000 filas de
+# `items` que estas consultas recorren, medido: el filtro de estado pasaba de
+# 260 ms (un patrón corto) a 811 ms solo por ser una alternancia de dos patrones
+# largos. ILIKE conserva la insensibilidad a mayúsculas, así que el cambio no
+# altera qué filas matchean.
+_KEY_LOS = "i.key_ ILIKE '%%hwGponDeviceOntAlarmLOSi%%'"
+_KEY_ONLINE = "i.key_ ILIKE '%%hwGponDeviceOntEthernetOnlineState%%'"
+
+
 def _nap_normalizada(col: str) -> str:
     """Rellena con ceros la parte numérica de la NAP para poder compararla con
     `nap_ocupacion.nap`, que la guarda con ancho fijo. Tal cual el documento."""
@@ -134,13 +144,13 @@ WHERE a.rol = 3
 # Unifica las dos consultas del documento: son la misma salvo por i.key_.
 Q_ZBX_ESTADO_CLIENTE = f"""
 SELECT DISTINCT ON (i.itemid)
-    CASE WHEN i.key_ ~* 'hwGponDeviceOntAlarmLOSi' THEN 'los' ELSE 'estado' END AS metrica,
+    CASE WHEN {_KEY_LOS} THEN 'los' ELSE 'estado' END AS metrica,
     h.value AS valor,
     floor((h.clock)/60)*60 AS time
 FROM items i
 JOIN hosts ho ON i.hostid = ho.hostid
 JOIN history_str h ON i.itemid = h.itemid
-WHERE i.key_ ~* '(hwGponDeviceOntAlarmLOSi|hwGponDeviceOntEthernetOnlineState)'
+WHERE ({_KEY_LOS} OR {_KEY_ONLINE})
   AND i.name !~* 'bigway'
   AND {_MATCH_CODE}
 ORDER BY i.itemid, h.clock DESC
@@ -164,7 +174,7 @@ WITH ultimos_logs AS (
     FROM items i
     JOIN hosts h ON i.hostid = h.hostid
     JOIN history_str g ON i.itemid = g.itemid
-    WHERE i.key_ ~* 'hwGponDeviceOntAlarmLOSi'
+    WHERE {_KEY_LOS}
       AND i.status = 0
       AND h.name !~* 'Solar'
       AND {_NAP_EXTRAIDA} = %s
@@ -197,7 +207,7 @@ SELECT DISTINCT
     i.snmp_oid AS oid
 FROM items i
 JOIN hosts h ON i.hostid = h.hostid
-WHERE i.key_ ~* 'hwGponDeviceOntAlarmLOSi'
+WHERE {_KEY_LOS}
   AND h.name ~* 'Solar'
   AND {_MATCH_CODE_SOLAR}
   AND i.snmp_oid IS NOT NULL
@@ -211,7 +221,7 @@ SELECT DISTINCT
     i.snmp_oid AS oid
 FROM items i
 JOIN hosts h ON i.hostid = h.hostid
-WHERE i.key_ ~* 'hwGponDeviceOntEthernetOnlineState'
+WHERE {_KEY_ONLINE}
   AND h.name ~* 'Solar'
   AND {_MATCH_CODE_SOLAR}
   AND i.snmp_oid IS NOT NULL
@@ -225,7 +235,7 @@ SELECT DISTINCT
     i.snmp_oid AS oid
 FROM items i
 JOIN hosts h ON i.hostid = h.hostid
-WHERE i.key_ ~* 'hwGponDeviceOntAlarmLOSi'
+WHERE {_KEY_LOS}
   AND h.name ~* 'Solar'
   AND i.snmp_oid IS NOT NULL
   AND {_NAP_EXTRAIDA} = %s
