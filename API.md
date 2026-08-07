@@ -12,7 +12,10 @@ y rendimiento están en [README.md](README.md).
 | `GET /api/v1/cortes/{numero_cliente}` | Si **un cliente** está caído y si el corte es de zona |
 | `GET /health` | Conectividad de las 5 bases y de `ping` / `snmpget` |
 
-Todos requieren el header `X-API-Key`. Documentación interactiva en `/docs`.
+Todos requieren el header `X-API-Key`. Cada consumidor tiene la suya: el nombre
+aparece en el log de cada request y es la unidad del rate limit, así que se le
+puede revocar a uno sin cortarle a los demás. Documentación interactiva en
+`/docs`.
 
 ## Detección de cortes
 
@@ -54,6 +57,8 @@ La combinación que importa para atención al cliente:
 |---|---|
 | `422` | `numero_cliente` no es numérico o pasa los 12 dígitos |
 | `403` | Falta o es inválido el header `X-API-Key` |
+| `429` | Rate limit del consumidor alcanzado. Trae `Retry-After` en segundos |
+| `504` | La detección superó `CORTES_TIMEOUT_SEG` (25 s) |
 | `404` | El cliente no existe o no tiene contrato activo en las categorías contempladas |
 | `503` | Gestión o el Zabbix de la tecnología correspondiente no responden |
 | `500` | Error inesperado |

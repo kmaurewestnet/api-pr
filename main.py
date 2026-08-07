@@ -18,6 +18,7 @@ async def lifespan(app: FastAPI):
     # Los pools se crean de forma diferida al primer uso (ver db.py), así que
     # acá solo hace falta liberarlos al apagar.
     yield
+    cortes.cerrar_ejecutor()
     db.close_all()
 
 

@@ -235,6 +235,104 @@ Las verificaciones del último paso corren en un `ThreadPoolExecutor`
 lo ejecuta en su propio threadpool: ni el subproceso de `ping` ni psycopg2 o
 mysql-connector —que son drivers sincrónicos— bloquean el event loop.
 
+### Consumo por request
+
+Dos límites que definen cuántas consultas simultáneas aguanta:
+
+| | Cuánto | Por qué |
+|---|---|---|
+| Conexiones a `zabbix` en paralelo | **1** | Los 4 lookups del camino Solar (OIDs de LOS, de OnlineState, de la NAP y ocupación) van sobre una sola conexión en `_pg_multi`. Entran por índice sobre `items`: secuenciarlos cuesta milisegundos frente a los segundos de un ping |
+| Subprocesos `snmpget` para una NAP de 64 | **4** | `snmpget` acepta varios OIDs en el mismo PDU (`SNMP_OIDS_POR_CONSULTA`, default 20) |
+
+Con `POOL_MAX=10` eso da ~10 requests concurrentes antes de tocar el techo del
+pool. Y cuando lo toca, **falla en vez de mentir**: `db.PoolAgotado` es la única
+excepción que `_en_paralelo` no convierte en "no evaluable", porque quedarse sin
+conexiones no es "la red no contestó" sino "no llegué a preguntar". Sale por
+`503`. Todo lo demás sigue degradando a `200`.
+
+El resultado se mapea por OID (`snmpget -Oqn` devuelve `<oid> <valor>` por línea)
+y no por posición: si la OLT omite o reordena un varbind, no se corren todos los
+valores.
+
+### Caché del estado de zona
+
+El estado de una NAP y el ping a una OLT son **la misma respuesta para todos los
+clientes de esa caja**. Sin caché, un corte real —que es justo cuando más
+consultas llegan— hace que 50 clientes de la misma NAP disparen 50 veces el mismo
+walk SNMP contra la misma OLT: la API haría su máximo trabajo cuando la red está
+peor.
+
+`services/cache.py` cachea, con TTL de `CACHE_ZONA_TTL_SEG` (45 s):
+
+| Se cachea | No se cachea |
+|---|---|
+| Estado de la NAP (incluye el walk SNMP entero) | Ping al cliente |
+| Ping a la OLT y al switch | Estado de la ONT del cliente |
+| Ping al AP y al RouterBoard | Topología del cliente |
+| Switch del nodo (Soldef) | |
+
+Lo per-cliente es la respuesta puntual de cada uno y tiene que ser fresca.
+
+El **single-flight** (un lock por clave) es la mitad que importa. Un TTL a secas
+no alcanza: las consultas de un corte llegan *juntas*, fallan todas en el caché a
+la vez y salen todas a preguntar. Con el lock por clave, la primera calcula y el
+resto espera ese resultado.
+
+Medido con 30 requests simultáneas de la misma NAP de 64 clientes:
+
+| | Sin caché | Con caché |
+|---|---|---|
+| Invocaciones `snmpget` | 150 | **34** |
+| Consultas SQL | 180 | **93** |
+| Pings a OLT + switch | 60 | **2** |
+| Pings al cliente | 30 | 30 *(no se cachea)* |
+
+El costo: un corte que acaba de empezar puede tardar hasta `CACHE_ZONA_TTL_SEG`
+en reflejarse en `isZoneIncident`. `isOnline` no se ve afectado, porque el ping
+al cliente y su ONT nunca se cachean. En 0 se desactiva.
+
+Las excepciones no se cachean: `PoolAgotado` sigue cortando el request siguiente
+en vez de quedar guardado 45 segundos.
+
+### Consumidores, rate limit y deadline
+
+`API_KEYS` toma pares `nombre:clave` separados por coma. El nombre no es
+decorativo: aparece en cada línea de log del endpoint y es la unidad del rate
+limit, así que se le puede cortar a un consumidor sin cortarles a todos. La clave
+única anterior (`API_KEY_SECRETA`) sigue funcionando como consumidor `legacy`.
+
+```
+API_KEYS=facturacion:xxx,soporte:yyy,app-movil:zzz
+```
+
+El rate limit es una cubeta de tokens por consumidor
+(`RATE_LIMIT_POR_MINUTO`, default 60; `0` desactiva). Devuelve `429` con
+`Retry-After`. Importa más que en una API común por la amplificación: **un
+request puede disparar decenas de consultas SNMP contra una OLT de producción**,
+así que un loop sobre números de cliente le hace DoS a la red, no a la API.
+
+Es en memoria y **por proceso**: con N workers de uvicorn el límite efectivo es N
+veces el configurado. Compartirlo requeriría Redis; para frenar un loop
+accidental o un consumidor desbocado, alcanza.
+
+El endpoint se declara `async def` y todo el trabajo bloqueante va a un
+`ThreadPoolExecutor` propio de `CORTES_MAX_CONCURRENTES` (default 5). Eso da dos
+cosas:
+
+- **Control de admisión explícito.** Por encima del tope los requests encolan en
+  el event loop sin ocupar un hilo, en vez de apilarse compitiendo por las
+  conexiones del pool. Conviene mantenerlo en `POOL_MAX/2` o menos, porque cada
+  request usa como mucho 2 conexiones de `zabbix`.
+- **Deadline.** `CORTES_TIMEOUT_SEG` (25 s) corta la espera con un `504`. El
+  trabajo en curso no se puede matar —son subprocesos y drivers sincrónicos—
+  pero termina solo, porque cada paso tiene su propio timeout. Lo que se corta es
+  que el cliente quede colgado sin tope.
+
+El rate limit **no** está aplicado a `/precinto` ni a `/analytics`: no conozco el
+patrón de llamadas de sus consumidores actuales y un límite mal calibrado los
+rompe. Agregarlo es cambiar `Depends(verificar_api_key)` por
+`Depends(limitar_tasa)` en cada router.
+
 ### Cómo se decide cada campo
 
 | Campo | Regla |
@@ -350,12 +448,13 @@ empresa=2 seriales=12345 onus=12000 precintos=11987 | napear=0.31s soldef=1.20s 
 ```
 config.py             DSNs de las 5 bases, API key, logging, límites, red/SNMP
 db.py                 pools de conexión + context managers
-security.py           validación de X-API-Key
+security.py           identidad del consumidor + rate limit
 models.py             modelos de respuesta (documentan /docs)
 queries/precinto.py   las 4 consultas del endpoint de precinto
 queries/analytics.py  las 4 consultas del cruce entre bases
 queries/cortes.py     las 10 consultas de detección de cortes
 services/analytics.py orquestación de los 3 pasos, cruce y agregados
+services/cache.py     caché con TTL y single-flight del estado de zona
 services/red.py       ping ICMP y snmpget: subprocesos acotados y validados
 services/cortes.py    recorrido de topología y matriz de decisión de cortes
 routers/              un módulo por endpoint

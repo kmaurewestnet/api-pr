@@ -4,14 +4,20 @@ Cubre lo que puede romperse en silencio: la matriz de decisión del punto 4 del
 documento, el umbral de corte de NAP, la interpretación de los valores de LOS y
 que ninguna consulta haya vuelto a la interpolación de strings.
 """
+import os
 import re
+import shutil
 import sys
+import tempfile
+import time
+import threading
 
 import config
 
 from queries import cortes as q
 from services import cortes as svc
 from services import red
+from services.cache import CacheTTL
 
 FALLA, RESPONDE, SIN_DATO = False, True, None
 
@@ -98,8 +104,9 @@ def test_ont_solar_combina_los_y_onlinestate():
     """El documento actualizado agrega la consulta de OIDs de OnlineState: una
     sola señal en alarma alcanza para dar la ONT por caida."""
     lecturas = {}
-    original = svc._leer_snmp
-    svc._leer_snmp = lambda ip, oids, interprete, metrica: lecturas.get(metrica, [])
+    original = svc._interpretar
+    svc._valores_snmp = lambda ip, oids: {}
+    svc._interpretar = lambda oids, val, interprete, metrica, ip: lecturas.get(metrica, [])
     try:
         lecturas = {"LOS": [False], "OnlineState": [False]}
         assert svc._ont_por_snmp("10.0.0.1", ["1.1"], ["1.2"]) is False
@@ -111,7 +118,7 @@ def test_ont_solar_combina_los_y_onlinestate():
         lecturas = {}
         assert svc._ont_por_snmp("10.0.0.1", ["1.1"], ["1.2"]) is None
     finally:
-        svc._leer_snmp = original
+        svc._interpretar = original
 
 
 def test_esta_offline():
@@ -247,22 +254,169 @@ def test_cantidad_de_parametros():
         assert real == cantidad, f"{nombre}: {real} placeholders, se esperaban {cantidad}"
 
 
-def test_oid_invalido_no_llega_a_snmpget():
-    """Los items de Zabbix pueden traer macros sin resolver en snmp_oid.
+def _snmpget_falso(tmp):
+    """snmpget de mentira: imprime '<oid> 2' por cada OID que recibe, en el mismo
+    formato que `snmpget -Oqn`."""
+    ruta = os.path.join(tmp, "snmpget")
+    with open(ruta, "w") as f:
+        f.write(
+            "#!/bin/sh\n"
+            "for a in \"$@\"; do\n"
+            "  case \"$a\" in [0-9]*.[0-9]*) echo \".$a 2\";; esac\n"
+            "done\n"
+        )
+    os.chmod(ruta, 0o755)
+    return ruta
 
-    Se apunta SNMPGET_PATH a /bin/echo: si un OID inválido llegara a ejecutarse,
-    echo devolvería 0 con salida y snmpget() no daría None. Es decir, la prueba
-    distingue "se rechazó antes de ejecutar" de "no se pudo ejecutar".
-    """
+
+def test_snmpget_lee_varios_oids_en_una_invocacion():
+    """Un solo subproceso para todos los OIDs, y el resultado mapeado por OID y
+    no por posición: si la OLT omite un varbind, no se corren los valores."""
     community, ruta = config.SNMP_COMMUNITY, config.SNMPGET_PATH
-    config.SNMP_COMMUNITY, config.SNMPGET_PATH = "publico-de-prueba", "/bin/echo"
+    tmp = tempfile.mkdtemp()
+    config.SNMP_COMMUNITY, config.SNMPGET_PATH = "prueba", _snmpget_falso(tmp)
     try:
-        for basura in ("{#SNMPINDEX}", "1.3.6.1; id", "", None, "1.3.6.1.x", "..1"):
-            assert red.snmpget("10.0.0.1", basura) is None, basura
-        # Control: con un OID bien formado sí se ejecuta el binario.
-        assert red.snmpget("10.0.0.1", "1.3.6.1.4.1.2011.1") is not None
+        pedidos = ["1.3.6.1.4.1.2011.1", "1.3.6.1.4.1.2011.2", "1.3.6.1.4.1.2011.3"]
+        valores = red.snmpget("10.0.0.1", pedidos)
+        assert valores == {o: "2" for o in pedidos}, valores
+
+        # Los OIDs invalidos se filtran antes del subproceso y no rompen al resto.
+        mezcla = ["{#SNMPINDEX}", "1.3.6.1.4.1.2011.1", "1.3.6.1; id", None, "..1"]
+        assert red.snmpget("10.0.0.1", mezcla) == {"1.3.6.1.4.1.2011.1": "2"}
+
+        # Ningun OID valido: no se ejecuta nada.
+        assert red.snmpget("10.0.0.1", ["{#SNMPINDEX}", ""]) == {}
+        # Host que no es una IP: no se ejecuta nada.
+        assert red.snmpget("10.0.0.1; rm -rf /", pedidos) == {}
     finally:
         config.SNMP_COMMUNITY, config.SNMPGET_PATH = community, ruta
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_cache_respeta_el_ttl():
+    llamadas = []
+    c = CacheTTL(ttl_seg=60, nombre="test")
+    assert c.obtener("k", lambda: llamadas.append(1) or "v") == "v"
+    assert c.obtener("k", lambda: llamadas.append(1) or "otro") == "v"
+    assert len(llamadas) == 1
+
+    # None es un resultado valido: repetir un SNMP que ya dio timeout no lo
+    # vuelve mas evaluable, y reintentar seria justo lo que hay que evitar.
+    c.obtener("n", lambda: None)
+    assert c.obtener("n", lambda: "recalculado") is None
+
+    # TTL vencido: se recalcula.
+    vencido = CacheTTL(ttl_seg=-1, nombre="test")
+    assert vencido.obtener("k", lambda: "a") == "a"
+    assert vencido.obtener("k", lambda: "b") == "b"
+
+
+def test_cache_single_flight():
+    """La mitad que importa. Las consultas de un corte llegan JUNTAS: con un TTL
+    a secas fallan las N a la vez y salen las N a preguntar."""
+    calculos = []
+    c = CacheTTL(ttl_seg=60, nombre="test")
+    barrera = threading.Barrier(8)
+
+    def calcular():
+        calculos.append(1)
+        time.sleep(0.05)          # ensancha la ventana de colision
+        return "valor"
+
+    def hilo():
+        barrera.wait()
+        assert c.obtener("misma-nap", calcular) == "valor"
+
+    hilos = [threading.Thread(target=hilo) for _ in range(8)]
+    for h in hilos:
+        h.start()
+    for h in hilos:
+        h.join()
+    assert len(calculos) == 1, f"se calculo {len(calculos)} veces, deberia ser 1"
+
+
+def test_cache_no_guarda_excepciones():
+    """PoolAgotado tiene que seguir cortando el request en la proxima consulta,
+    no quedar cacheado 45 segundos."""
+    import db
+
+    c = CacheTTL(ttl_seg=60, nombre="test")
+    for _ in range(2):
+        try:
+            c.obtener("k", lambda: (_ for _ in ()).throw(db.PoolAgotado("x")))
+            raise AssertionError("deberia haber propagado")
+        except db.PoolAgotado:
+            pass
+    assert c.obtener("k", lambda: "ok") == "ok"
+
+
+def test_pool_agotado_corta_el_request():
+    """Quedarse sin conexiones no es "no se pudo verificar": es no haber
+    preguntado. Si se tragara como None, la API devolveria 200 con una respuesta
+    calculada sobre datos que nunca se consultaron."""
+    import db
+
+    def falla():
+        raise db.PoolAgotado("sin conexiones libres a 'zabbix'")
+
+    # Una verificacion cualquiera que falla NO corta: eso es degradacion sana.
+    r = svc._en_paralelo({"a": lambda: 1, "b": lambda: 1 / 0})
+    assert r == {"a": 1, "b": None}
+
+    # El pool agotado si corta, y llega al router como 503.
+    try:
+        svc._en_paralelo({"a": lambda: 1, "b": falla})
+        raise AssertionError("deberia haber propagado PoolAgotado")
+    except db.PoolAgotado:
+        pass
+    assert issubclass(db.PoolAgotado, db.DatabaseUnavailable)
+
+
+def test_api_keys_por_consumidor():
+    """La clave deja de ser un secreto compartido anonimo: cada consumidor tiene
+    la suya, y el nombre es lo que identifica quien llama en el log y lo que el
+    rate limit usa como unidad."""
+    import security
+
+    crudo, legacy = config.API_KEYS_CRUDO, config.API_KEY_SECRETA
+    try:
+        config.API_KEYS_CRUDO = "facturacion:clave-a, soporte:clave-b ,  , mal-formada"
+        config.API_KEY_SECRETA = "clave-vieja"
+        claves = security._cargar_claves()
+        assert claves == {
+            "clave-a": "facturacion",
+            "clave-b": "soporte",
+            # La clave unica anterior sigue andando: migrar no puede ser un corte.
+            "clave-vieja": "legacy",
+        }, claves
+
+        # Una clave puede contener ':'; el nombre no.
+        config.API_KEYS_CRUDO = "app:tok:en:largo"
+        config.API_KEY_SECRETA = ""
+        assert security._cargar_claves() == {"tok:en:largo": "app"}
+
+        # Sin nada configurado, falla cerrado.
+        config.API_KEYS_CRUDO = ""
+        assert security._cargar_claves() == {}
+    finally:
+        config.API_KEYS_CRUDO, config.API_KEY_SECRETA = crudo, legacy
+
+
+def test_rate_limit_por_consumidor():
+    from security import CubetaDeTokens
+
+    cubeta = CubetaDeTokens(por_minuto=60, burst=3)
+    # La rafaga entra completa...
+    assert [cubeta.consumir("a")[0] for _ in range(3)] == [True, True, True]
+    # ...y despues corta, con un tiempo de espera util para el Retry-After.
+    permitido, espera = cubeta.consumir("a")
+    assert permitido is False and 0 < espera <= 1
+
+    # Un consumidor desbocado no le consume la cuota a los demas.
+    assert cubeta.consumir("b")[0] is True
+
+    # En 0 se desactiva.
+    assert all(CubetaDeTokens(0, 1).consumir("x")[0] for _ in range(50))
 
 
 if __name__ == "__main__":
