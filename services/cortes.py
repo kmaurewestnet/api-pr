@@ -44,7 +44,10 @@ log = logging.getLogger(__name__)
 # el del ping), no las consultas intermedias, así que un hit ahorra el walk SNMP
 # entero. Nada por cliente entra acá.
 _zona = CacheTTL(
-    config.CACHE_ZONA_TTL_SEG, config.CACHE_MAX_ENTRADAS, nombre="zona"
+    config.CACHE_ZONA_TTL_SEG,
+    config.CACHE_MAX_ENTRADAS,
+    nombre="zona",
+    stale_max_seg=config.CACHE_STALE_MAX_SEG,
 )
 
 

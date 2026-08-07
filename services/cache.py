@@ -13,6 +13,13 @@ calcula y las otras 49 esperan ese resultado.
 
 No se cachea nada por cliente —ni el ping al cliente ni el estado de su ONT—:
 eso es la respuesta puntual de cada uno y tiene que ser fresca.
+
+El valor vencido no se tira: si el recálculo falla o devuelve "no evaluable", se
+sirve el anterior. Sin eso, un pico de lentitud en Zabbix durante un corte real
+hace que la consulta de NAP se pase del statement_timeout, `nap_caida` quede en
+None y —con la OLT respondiendo— `isZoneIncident` pase a false con un 200 OK: la
+API diría "no hay corte" en medio del corte. Un estado de NAP de hace dos
+minutos es incomparablemente mejor que eso.
 """
 import logging
 import threading
@@ -22,11 +29,13 @@ log = logging.getLogger(__name__)
 
 
 class CacheTTL:
-    def __init__(self, ttl_seg: int, limite: int = 5000, nombre: str = ""):
+    def __init__(self, ttl_seg: int, limite: int = 5000, nombre: str = "",
+                 stale_max_seg: int = 0):
         self._ttl = ttl_seg
+        self._stale_max = stale_max_seg
         self._limite = limite
         self._nombre = nombre
-        self._valores = {}          # clave -> (valor, vence_en)
+        self._valores = {}          # clave -> (valor, vence_en, calculado_en)
         self._locks = {}            # clave -> Lock de cálculo
         self._maestro = threading.Lock()
 
@@ -39,18 +48,45 @@ class CacheTTL:
             return True, entrada[0]
         return False, None
 
+    def _vencido_utilizable(self, clave):
+        """(hay_valor, valor, antigüedad) del valor vencido, si todavía sirve.
+
+        Solo sirve un valor real: un None viejo no aporta nada sobre un None
+        nuevo. Y solo dentro de `stale_max` desde que se calculó de verdad, para
+        que una NAP que dejó de tener datos no quede reportada como caída para
+        siempre.
+        """
+        entrada = self._valores.get(clave)
+        if entrada is None:
+            return False, None, 0
+        valor, _, calculado_en = entrada
+        edad = time.monotonic() - calculado_en
+        if valor is None or edad > self._ttl + self._stale_max:
+            return False, None, edad
+        return True, valor, edad
+
+    def _guardar(self, clave, valor, calculado_en):
+        with self._maestro:
+            self._valores[clave] = (valor, time.monotonic() + self._ttl, calculado_en)
+
     def _purgar(self):
-        """Descarta lo vencido. Las claves son NAPs y OLTs, un conjunto acotado;
-        esto cubre el caso de una `nap` mal extraída que genere claves basura."""
-        ahora = time.monotonic()
-        vencidas = [k for k, (_, hasta) in self._valores.items() if hasta <= ahora]
-        for k in vencidas:
+        """Descarta lo que ya no sirve ni como valor vencido. Las claves son NAPs
+        y OLTs, un conjunto acotado; esto cubre el caso de una `nap` mal extraída
+        que genere claves basura."""
+        limite = time.monotonic() - (self._ttl + self._stale_max)
+        for k in [k for k, (_, _, cal) in self._valores.items() if cal <= limite]:
             self._valores.pop(k, None)
             self._locks.pop(k, None)
 
     def obtener(self, clave, calcular):
-        """Valor cacheado, o el de `calcular()` si venció. Una excepción no se
-        cachea y se propaga: PoolAgotado tiene que seguir cortando el request."""
+        """Valor cacheado, o el de `calcular()` si venció.
+
+        Si el recálculo falla o devuelve None y hay un valor anterior utilizable,
+        se sirve ese: una medición real de hace un rato vale más que un "no
+        evaluable", que aguas abajo se traduce en "no hay corte". Se le renueva
+        el TTL para no reintentar en cada request, pero no la antigüedad, así que
+        igual caduca a los `stale_max`.
+        """
         if self._ttl <= 0:
             return calcular()
 
@@ -71,9 +107,32 @@ class CacheTTL:
             if hay:
                 log.debug("cache %s hit tras espera: %s", self._nombre, clave)
                 return valor
-            valor = calcular()
-            with self._maestro:
-                self._valores[clave] = (valor, time.monotonic() + self._ttl)
+
+            ahora = time.monotonic()
+            try:
+                valor = calcular()
+            except Exception as e:
+                hay_previo, previo, edad = self._vencido_utilizable(clave)
+                if not hay_previo:
+                    raise
+                log.warning(
+                    "cache %s: %s falló (%s), se sirve el valor de hace %.0fs",
+                    self._nombre, clave, e, edad,
+                )
+                self._guardar(clave, previo, ahora - edad)
+                return previo
+
+            if valor is None:
+                hay_previo, previo, edad = self._vencido_utilizable(clave)
+                if hay_previo:
+                    log.warning(
+                        "cache %s: %s quedó sin dato, se sirve el de hace %.0fs",
+                        self._nombre, clave, edad,
+                    )
+                    self._guardar(clave, previo, ahora - edad)
+                    return previo
+
+            self._guardar(clave, valor, ahora)
             return valor
 
     def limpiar(self):

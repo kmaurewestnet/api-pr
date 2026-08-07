@@ -291,8 +291,30 @@ El costo: un corte que acaba de empezar puede tardar hasta `CACHE_ZONA_TTL_SEG`
 en reflejarse en `isZoneIncident`. `isOnline` no se ve afectado, porque el ping
 al cliente y su ONT nunca se cachean. En 0 se desactiva.
 
-Las excepciones no se cachean: `PoolAgotado` sigue cortando el request siguiente
-en vez de quedar guardado 45 segundos.
+#### El valor vencido no se tira
+
+Si el recálculo **falla o devuelve "no evaluable"** y hay un valor anterior real,
+se sirve ese, hasta `CACHE_STALE_MAX_SEG` (300 s) desde que se midió de verdad.
+
+No es un lujo. La consulta de estado de NAP tarda ~5-7 s contra un
+`CORTES_STATEMENT_TIMEOUT_MS` de 15 s. Si en un pico de carga se pasa, `nap_caida`
+queda en `None`, y con la OLT respondiendo:
+
+```python
+is_zone_incident = nap is True or ping_olt is False   # None → False
+```
+
+o sea que **durante un corte de zona real, un Zabbix lento haría que la API
+responda `isZoneIncident: false` con 200 OK**. Una medición real de hace dos
+minutos vale incomparablemente más que eso.
+
+Al servir un valor viejo se le renueva el TTL —para no reintentar la consulta
+cara en cada request— pero **no** su antigüedad, así que igual caduca a los
+`CACHE_STALE_MAX_SEG`: una NAP que dejó de reportar no queda marcada como caída
+indefinidamente. Cada vez que pasa, queda un `WARNING` con la edad del dato.
+
+Sin valor previo utilizable no hay nada que servir y la excepción se propaga:
+`PoolAgotado` sigue saliendo por 503.
 
 ### Consumidores, rate limit y deadline
 

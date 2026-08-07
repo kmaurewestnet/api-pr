@@ -187,6 +187,13 @@ SNMP_OIDS_POR_CONSULTA = _int("SNMP_OIDS_POR_CONSULTA", 20)
 # respuesta. En 0 se desactiva. No se cachea nada por cliente.
 CACHE_ZONA_TTL_SEG = _int("CACHE_ZONA_TTL_SEG", 45)
 CACHE_MAX_ENTRADAS = _int("CACHE_MAX_ENTRADAS", 5000)
+# Cuánto se sigue sirviendo un valor vencido cuando el recálculo falla o queda
+# en "no evaluable". Protege el caso que importa: durante un corte real, un pico
+# de lentitud en Zabbix hace que la consulta de NAP se pase del
+# statement_timeout y `isZoneIncident` pase a false con 200 OK. Pasado este
+# plazo se acepta el "sin dato", para que una NAP que dejó de reportar no quede
+# marcada como caída indefinidamente.
+CACHE_STALE_MAX_SEG = _int("CACHE_STALE_MAX_SEG", 300)
 
 # Tope de tiempo de respuesta. Vencido, el cliente recibe 504: el trabajo en
 # curso no se puede matar (son subprocesos y drivers sincrónicos), pero termina

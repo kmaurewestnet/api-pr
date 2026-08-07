@@ -305,10 +305,17 @@ def test_cache_respeta_el_ttl():
     c.obtener("n", lambda: None)
     assert c.obtener("n", lambda: "recalculado") is None
 
-    # TTL vencido: se recalcula.
-    vencido = CacheTTL(ttl_seg=-1, nombre="test")
-    assert vencido.obtener("k", lambda: "a") == "a"
-    assert vencido.obtener("k", lambda: "b") == "b"
+    # TTL vencido: se recalcula. (ttl <= 0 es el interruptor de "desactivado",
+    # no "siempre vencido": para simular vencimiento hace falta un TTL real.)
+    corto = CacheTTL(ttl_seg=0.01, nombre="test")
+    assert corto.obtener("k", lambda: "a") == "a"
+    time.sleep(0.05)
+    assert corto.obtener("k", lambda: "b") == "b"
+
+    # Y en 0 se desactiva de verdad.
+    apagado = CacheTTL(ttl_seg=0, nombre="test")
+    assert apagado.obtener("k", lambda: "a") == "a"
+    assert apagado.obtener("k", lambda: "b") == "b"
 
 
 def test_cache_single_flight():
@@ -335,12 +342,50 @@ def test_cache_single_flight():
     assert len(calculos) == 1, f"se calculo {len(calculos)} veces, deberia ser 1"
 
 
+def test_cache_sirve_el_valor_viejo_si_el_recalculo_falla():
+    """El escenario que esto existe para evitar: durante un corte real, la
+    consulta de NAP se pasa del statement_timeout, nap_caida queda en None y
+    -con la OLT respondiendo- isZoneIncident pasa a false con 200 OK."""
+    c = CacheTTL(ttl_seg=0.01, nombre="test", stale_max_seg=300)
+
+    def vencido():
+        time.sleep(0.05)
+
+    assert c.obtener("nap", lambda: True) is True     # medicion real
+    vencido()
+    assert c.obtener("nap", lambda: None) is True     # sin dato -> se sirve el viejo
+    vencido()
+    assert c.obtener("nap", lambda: 1 / 0) is True    # error    -> se sirve el viejo
+    vencido()
+    assert c.obtener("nap", lambda: False) is False   # dato nuevo -> manda el nuevo
+    vencido()
+    assert c.obtener("nap", lambda: None) is False
+
+    # Sin valor previo utilizable no hay nada que servir: el error se propaga.
+    try:
+        c.obtener("otra", lambda: 1 / 0)
+        raise AssertionError("deberia haber propagado")
+    except ZeroDivisionError:
+        pass
+    # ...y un None sin previo sigue siendo None.
+    assert c.obtener("otra", lambda: None) is None
+
+
+def test_cache_no_sirve_valores_viejos_para_siempre():
+    """Pasado stale_max se acepta el 'sin dato': una NAP que dejo de reportar no
+    puede quedar marcada como caida indefinidamente."""
+    c = CacheTTL(ttl_seg=0.01, nombre="test", stale_max_seg=0)
+    assert c.obtener("nap", lambda: True) is True
+    time.sleep(0.05)
+    assert c.obtener("nap", lambda: None) is None
+
+
 def test_cache_no_guarda_excepciones():
     """PoolAgotado tiene que seguir cortando el request en la proxima consulta,
     no quedar cacheado 45 segundos."""
     import db
 
-    c = CacheTTL(ttl_seg=60, nombre="test")
+    c = CacheTTL(ttl_seg=60, nombre="test", stale_max_seg=300)
     for _ in range(2):
         try:
             c.obtener("k", lambda: (_ for _ in ()).throw(db.PoolAgotado("x")))
