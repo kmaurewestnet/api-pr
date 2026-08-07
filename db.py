@@ -1,8 +1,15 @@
-"""Pools de conexión a las tres bases de datos.
+"""Pools de conexión a las bases de datos.
 
 Los pools se crean de forma diferida (al primer uso) y no al importar el módulo:
 así la API arranca y el endpoint de precinto sigue funcionando aunque las
-credenciales de Soldef o Napear todavía no estén configuradas.
+credenciales de Soldef, Napear, Gestión o Zabbix Wireless todavía no estén
+configuradas.
+
+    zabbix           PostgreSQL  Zabbix de fibra (items, hosts, history, nap_ocupacion)
+    zabbix_wireless  PostgreSQL  Zabbix de wireless (instancia separada)
+    soldef           PostgreSQL  inventario: bocas, precintos y aparatos de nodo
+    napear           MySQL       reservas/empresas
+    gestion          MySQL       clientes, contratos y conexiones
 """
 import logging
 import threading
@@ -35,12 +42,14 @@ def _crear_pool_pg(nombre: str, dsn: dict) -> ThreadedConnectionPool:
     )
 
 
-def _crear_pool_mysql(dsn: dict):
-    # Import diferido: sin este endpoint, mysql-connector-python no hace falta.
+def _crear_pool_mysql(nombre: str, dsn: dict):
+    # Import diferido: sin estos endpoints, mysql-connector-python no hace falta.
     from mysql.connector import pooling
 
+    # pool_name tiene que ser único por proceso: napear y gestion son dos bases
+    # MySQL distintas y cada una necesita su propio pool.
     return pooling.MySQLConnectionPool(
-        pool_name="napear",
+        pool_name=nombre,
         pool_size=min(config.POOL_MAX, 32),
         **dsn,
     )
@@ -48,9 +57,16 @@ def _crear_pool_mysql(dsn: dict):
 
 _FABRICAS = {
     "zabbix": lambda: _crear_pool_pg("zabbix", config.ZBX_DSN),
+    "zabbix_wireless": lambda: _crear_pool_pg(
+        "zabbix_wireless", config.zbx_wireless_dsn()
+    ),
     "soldef": lambda: _crear_pool_pg("soldef", config.soldef_dsn()),
-    "napear": lambda: _crear_pool_mysql(config.nap_dsn()),
+    "napear": lambda: _crear_pool_mysql("napear", config.nap_dsn()),
+    "gestion": lambda: _crear_pool_mysql("gestion", config.gestion_dsn()),
 }
+
+# Las que hablan MySQL: el context manager y el ping son distintos de los de PG.
+_MYSQL = ("napear", "gestion")
 
 
 def _pool(nombre: str):
@@ -104,13 +120,31 @@ def soldef_conn():
 
 
 @contextmanager
-def napear_conn():
-    conn = _pool("napear").get_connection()
+def zabbix_wireless_conn():
+    with _conexion_pg("zabbix_wireless") as conn:
+        yield conn
+
+
+@contextmanager
+def _conexion_mysql(nombre: str):
+    conn = _pool(nombre).get_connection()
     try:
         yield conn
     finally:
         # En mysql-connector, close() devuelve la conexión al pool.
         conn.close()
+
+
+@contextmanager
+def napear_conn():
+    with _conexion_mysql("napear") as conn:
+        yield conn
+
+
+@contextmanager
+def gestion_conn():
+    with _conexion_mysql("gestion") as conn:
+        yield conn
 
 
 @contextmanager
@@ -129,8 +163,8 @@ def cursor_pg(conn, statement_timeout_ms: int = None):
 
 def ping(nombre: str) -> bool:
     """SELECT 1 contra la base indicada. Usado por /health."""
-    if nombre == "napear":
-        with napear_conn() as conn:
+    if nombre in _MYSQL:
+        with _conexion_mysql(nombre) as conn:
             cur = conn.cursor()
             try:
                 cur.execute("SELECT 1")

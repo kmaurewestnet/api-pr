@@ -1,4 +1,4 @@
-"""Modelos de respuesta del endpoint de analíticas (documentan /docs)."""
+"""Modelos de respuesta de los endpoints (documentan /docs)."""
 from typing import List, Optional
 
 from pydantic import BaseModel, Field
@@ -89,3 +89,21 @@ class AnalyticsResponse(BaseModel):
     metadata: Metadata
     resumen: Resumen
     dispositivos: List[Dispositivo]
+
+
+class CorteResponse(BaseModel):
+    """Salida del endpoint de cortes. Contrato cerrado: exactamente estos tres
+    campos, sin envoltorio ni metadata. El detalle de cada verificación queda en
+    el log del servidor, no en la respuesta."""
+
+    isFtth: bool = Field(
+        description="El plan activo es de fibra: category_id 16. 17 es wireless"
+    )
+    isOnline: bool = Field(
+        description="False solo si el ping al cliente falla y la ONT reporta "
+                    "LOS/Offline. En wireless, es el ping al cliente."
+    )
+    isZoneIncident: bool = Field(
+        description="Fibra: NAP en corte, o la OLT no responde. "
+                    "Wireless: el AP o el RouterBoard del nodo no responden."
+    )

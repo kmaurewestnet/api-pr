@@ -71,6 +71,32 @@ def nap_dsn() -> dict:
     }
 
 
+def gestion_dsn() -> dict:
+    """DSN de Gestión (MySQL). Es la base de clientes/contratos, distinta de
+    napear. Resolución diferida, igual que soldef_dsn."""
+    return {
+        "host": _require("DB_GESTION_HOST"),
+        "port": _int("DB_GESTION_PORT", 3306),
+        "database": _require("DB_GESTION_NAME"),
+        "user": _require("DB_GESTION_USER"),
+        "password": _require("DB_GESTION_PASS"),
+        "connection_timeout": 10,
+    }
+
+
+def zbx_wireless_dsn() -> dict:
+    """DSN del Zabbix de Wireless (PostgreSQL). Es una instancia separada de la
+    de fibra: mismo esquema, otro servidor."""
+    return {
+        "host": _require("DB_ZBX_WIFI_HOST"),
+        "port": _int("DB_ZBX_WIFI_PORT", 5432),
+        "dbname": _require("DB_ZBX_WIFI_NAME"),
+        "user": _require("DB_ZBX_WIFI_USER"),
+        "password": _require("DB_ZBX_WIFI_PASS"),
+        "connect_timeout": 10,
+    }
+
+
 # --- Límites de las consultas pesadas ---
 
 # --- Clasificación de las caídas ---
@@ -93,6 +119,42 @@ STATEMENT_TIMEOUT_MS = _int("STATEMENT_TIMEOUT_MS", 120000)
 # simultáneas de zabbix (RX, estado y LOS en paralelo).
 POOL_MIN = _int("POOL_MIN", 1)
 POOL_MAX = _int("POOL_MAX", 10)
+
+
+# --- Detección de cortes (endpoint /api/v1/cortes) ---
+
+# Categorías de plan de Gestión (`category.category_id`). Son las dos únicas
+# tecnologías que contempla el endpoint y las dos únicas que trae la consulta:
+# van juntas acá para que el `IN` del SQL y la decisión de isFtth no puedan
+# quedar desalineados.
+CATEGORIA_FTTH_ID = _int("CATEGORIA_FTTH_ID", 16)
+CATEGORIA_WIRELESS_ID = _int("CATEGORIA_WIRELESS_ID", 17)
+
+# Una NAP se considera caída cuando TODOS sus clientes reportan LOS. En NAPs de
+# más de este tamaño se tolera un cliente sin reportar (puede estar de baja o con
+# el item deshabilitado).
+NAP_TOLERANCIA_DESDE = _int("NAP_TOLERANCIA_DESDE", 3)
+
+# Timeout propio de las consultas del endpoint de cortes: tiene que responder en
+# segundos, no puede heredar los 120 s de las consultas de analíticas.
+CORTES_STATEMENT_TIMEOUT_MS = _int("CORTES_STATEMENT_TIMEOUT_MS", 15000)
+# Verificaciones (pings, snmpget y queries) que corren en paralelo por request.
+CORTES_MAX_WORKERS = _int("CORTES_MAX_WORKERS", 6)
+# Techo de OIDs a consultar por SNMP al evaluar una NAP. Protege contra un
+# `nap` mal extraído que devuelva cientos de items: cada OID es un subproceso.
+CORTES_MAX_OIDS_NAP = _int("CORTES_MAX_OIDS_NAP", 64)
+
+# --- Utilidades del sistema: ping ICMP y SNMP ---
+
+PING_PATH = os.getenv("PING_PATH", "/bin/ping")
+PING_COUNT = _int("PING_COUNT", 2)
+PING_TIMEOUT_SEG = _int("PING_TIMEOUT_SEG", 2)
+
+SNMPGET_PATH = os.getenv("SNMPGET_PATH", "/usr/bin/snmpget")
+SNMP_COMMUNITY = os.getenv("SNMP_COMMUNITY", "")
+SNMP_VERSION = os.getenv("SNMP_VERSION", "2c")
+SNMP_TIMEOUT_SEG = _int("SNMP_TIMEOUT_SEG", 3)
+SNMP_RETRIES = _int("SNMP_RETRIES", 1)
 
 
 def setup_logging() -> None:

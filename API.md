@@ -9,9 +9,59 @@ y rendimiento están en [README.md](README.md).
 |---|---|
 | `GET /api/v1/precinto/{codigo}` | Series históricas de **una** ONU: RX, OLT RX, logs, estados |
 | `GET /api/v1/empresa/{id}/analytics` | Estado del **parque completo** de una empresa |
-| `GET /health` | Conectividad de las 3 bases por separado |
+| `GET /api/v1/cortes/{numero_cliente}` | Si **un cliente** está caído y si el corte es de zona |
+| `GET /health` | Conectividad de las 5 bases y de `ping` / `snmpget` |
 
 Todos requieren el header `X-API-Key`. Documentación interactiva en `/docs`.
+
+## Detección de cortes
+
+```bash
+curl -H "X-API-Key: $API_KEY" "http://localhost:8000/api/v1/cortes/302381"
+```
+
+`numero_cliente`: solo dígitos, hasta 12 caracteres. Es el `customer.code` de
+Gestión.
+
+La respuesta son **exactamente** estos tres campos, sin envoltorio:
+
+```json
+{
+  "isFtth": true,
+  "isOnline": false,
+  "isZoneIncident": true
+}
+```
+
+| Campo | Qué significa |
+|---|---|
+| `isFtth` | El plan activo del cliente es de fibra (`category_id` 16). `false` = wireless (17) |
+| `isOnline` | El cliente está navegando. Fibra: `false` solo si no responde al ping **y** la ONT reporta LOS/Offline. Wireless: el ping al cliente |
+| `isZoneIncident` | El corte afecta a más gente. Fibra: la NAP está en corte o la OLT no responde. Wireless: el AP o el RouterBoard del nodo no responden |
+
+La combinación que importa para atención al cliente:
+
+| `isOnline` | `isZoneIncident` | Lectura |
+|---|---|---|
+| `false` | `true` | Corte de zona: hay otros clientes afectados, ya hay cuadrilla o incidente |
+| `false` | `false` | Falla individual: ONT, corte de energía en el domicilio, cable |
+| `true` | `true` | El cliente navega pero hay un incidente cerca; puede estar degradado |
+| `true` | `false` | Todo normal desde la red |
+
+### Códigos de error
+
+| Código | Cuándo |
+|---|---|
+| `422` | `numero_cliente` no es numérico o pasa los 12 dígitos |
+| `403` | Falta o es inválido el header `X-API-Key` |
+| `404` | El cliente no existe o no tiene contrato activo en las categorías contempladas |
+| `503` | Gestión o el Zabbix de la tecnología correspondiente no responden |
+| `500` | Error inesperado |
+
+Una verificación suelta que falle (un ping, un `snmpget`, una consulta de estado)
+**no** rompe la respuesta: esa señal queda como "no evaluable", se loguea, y no
+cuenta como falla en la decisión. El `503` se reserva para cuando falta el dato
+sin el cual la respuesta sería inventada.
 
 ## Parámetros de analytics
 
