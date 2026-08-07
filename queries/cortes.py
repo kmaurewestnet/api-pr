@@ -54,14 +54,27 @@ _MATCH_CODE_SOLAR = (
 )
 
 
-# `~*` con un patrón sin metacaracteres es exactamente `ILIKE '%patrón%'`, pero
-# lo resuelve el motor de regex fila por fila. Sobre las ~156.000 filas de
-# `items` que estas consultas recorren, medido: el filtro de estado pasaba de
-# 260 ms (un patrón corto) a 811 ms solo por ser una alternancia de dos patrones
-# largos. ILIKE conserva la insensibilidad a mayúsculas, así que el cambio no
-# altera qué filas matchean.
-_KEY_LOS = "i.key_ ILIKE '%%hwGponDeviceOntAlarmLOSi%%'"
-_KEY_ONLINE = "i.key_ ILIKE '%%hwGponDeviceOntEthernetOnlineState%%'"
+# Filtro de key_ **anclado al principio**, que es lo único que puede entrar por
+# índice. Las keys de Zabbix tienen la forma:
+#
+#     hwGponDeviceOntAlarmLOSi.[{#SNMPINDEX}]
+#     hwGponDeviceOntAlarmLOSi.[4194312192.0]
+#
+# o sea el patrón es un prefijo, no una subcadena. Con `LIKE 'patrón%%'` y el
+# índice `items_key_pattern_idx` (ver README) se evita recorrer las ~156.000
+# filas de `items`, que era el costo dominante de las tres consultas del camino
+# FTTH: medido, 616 ms de los 645 ms de la consulta de estado.
+#
+# Se pasó por dos etapas y las dos están medidas: `~*` (811 ms de scan) ->
+# `ILIKE '%%patrón%%'` (616 ms, saca el motor de regex pero sigue escaneando
+# todo) -> `LIKE 'patrón%%'` (entra por índice).
+#
+# LIKE es sensible a mayúsculas, a diferencia del `~*` original. Es correcto
+# porque la capitalización de estas keys está verificada contra la base; si
+# alguna vez cambia, la consulta devuelve cero filas en silencio y el estado de
+# ONT queda en "no evaluable". El chequeo está en el README.
+_KEY_LOS = "i.key_ LIKE 'hwGponDeviceOntAlarmLOSi%%'"
+_KEY_ONLINE = "i.key_ LIKE 'hwGponDeviceOntEthernetOnlineState%%'"
 
 
 def _nap_normalizada(col: str) -> str:

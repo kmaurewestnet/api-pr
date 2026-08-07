@@ -431,6 +431,37 @@ Un cliente con fibra **y** wireless activos a la vez se resuelve como fibra, y s
 loguea un warning. Sin ese criterio explícito la respuesta dependería del orden
 en que MySQL devolviera las filas, que no está garantizado.
 
+## Índices que espera esta API en Zabbix
+
+Las tres consultas del camino FTTH filtran `items` por `key_`. Sin índice, cada
+una recorre las ~156.000 filas de la tabla: medido, 616 ms de los 645 ms de la
+consulta de estado de ONT.
+
+```sql
+CREATE INDEX CONCURRENTLY IF NOT EXISTS items_key_pattern_idx
+    ON items (key_ varchar_pattern_ops);
+ANALYZE items;
+```
+
+`varchar_pattern_ops` es lo que hace que `LIKE 'patrón%'` pueda usar el índice
+cuando la base no está en collation C. `CONCURRENTLY` para no bloquear `items`
+en un Zabbix vivo; la tabla casi no se escribe (solo al provisionar o descubrir),
+así que mantenerlo es despreciable.
+
+**Las consultas usan `LIKE` anclado, que es sensible a mayúsculas**, a diferencia
+del `~*` del documento original. Eso es lo que permite el índice. Si alguna vez
+cambia la capitalización de una key, la consulta devuelve cero filas **en
+silencio** y el estado de ONT queda en "no evaluable". El chequeo:
+
+```sql
+SELECT key_, count(*) FROM items
+WHERE key_ ILIKE '%hwGponDeviceOntAlarmLOSi%' OR key_ ILIKE '%OnlineState%'
+GROUP BY key_ ORDER BY 2 DESC LIMIT 10;
+```
+
+Las keys tienen que empezar exactamente con `hwGponDeviceOntAlarmLOSi` y
+`hwGponDeviceOntEthernetOnlineState`.
+
 ## Rendimiento
 
 La consulta a Zabbix separa dos cosas de naturaleza distinta:
