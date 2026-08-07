@@ -45,8 +45,24 @@ def _int(nombre: str, default: int) -> int:
 # --- API ---
 
 API_KEY_NAME = "X-API-Key"
-API_KEY_SECRETA = os.getenv("API_KEY_SECRETA", "")
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
+
+# Una clave por consumidor, en formato `nombre:clave` separados por coma. El
+# nombre no es decorativo: identifica quién llama en cada línea de log y es la
+# unidad del rate limit, así que se le puede cortar a uno sin cortarle a todos.
+# El nombre no puede tener ':' ni ','; la clave sí puede tener ':'.
+API_KEYS_CRUDO = os.getenv("API_KEYS", "")
+# Compatibilidad: la clave única de antes sigue funcionando, como consumidor
+# "legacy". Migrar a API_KEYS es lo que da atribución y revocación selectiva.
+API_KEY_SECRETA = os.getenv("API_KEY_SECRETA", "")
+
+# Rate limit por consumidor, cubeta de tokens. En 0 se desactiva.
+# Importa más que en una API común: un request puede disparar decenas de
+# consultas SNMP contra una OLT de producción, así que un loop sobre números de
+# cliente le hace DoS a la red, no a la API.
+RATE_LIMIT_POR_MINUTO = _int("RATE_LIMIT_POR_MINUTO", 60)
+# Ráfaga tolerada. Por defecto, un minuto entero de golpe.
+RATE_LIMIT_BURST = _int("RATE_LIMIT_BURST", RATE_LIMIT_POR_MINUTO)
 
 # --- Bases de datos ---
 # Zabbix conserva los nombres de variable originales para no romper el .env en
@@ -157,8 +173,30 @@ CORTES_STATEMENT_TIMEOUT_MS = _int("CORTES_STATEMENT_TIMEOUT_MS", 15000)
 # Verificaciones (pings, snmpget y queries) que corren en paralelo por request.
 CORTES_MAX_WORKERS = _int("CORTES_MAX_WORKERS", 6)
 # Techo de OIDs a consultar por SNMP al evaluar una NAP. Protege contra un
-# `nap` mal extraído que devuelva cientos de items: cada OID es un subproceso.
+# `nap` mal extraído que devuelva cientos de items.
 CORTES_MAX_OIDS_NAP = _int("CORTES_MAX_OIDS_NAP", 64)
+# OIDs que van en una sola invocación de snmpget. snmpget acepta varios en el
+# mismo PDU: 64 OIDs pasan de 64 subprocesos a 4. El tope existe porque un PDU
+# de respuesta que no entra en la MTU se pierde entero; 20 deja margen entre el
+# largo típico de un OID de Huawei y los ~1500 bytes de un datagrama UDP.
+SNMP_OIDS_POR_CONSULTA = _int("SNMP_OIDS_POR_CONSULTA", 20)
+
+# Caché del estado compartido por todos los clientes de una misma caja: estado de
+# NAP, ping a la OLT, ping al switch y el switch del nodo. Durante un corte real
+# llegan decenas de consultas de la misma NAP a la vez, y todas tienen la misma
+# respuesta. En 0 se desactiva. No se cachea nada por cliente.
+CACHE_ZONA_TTL_SEG = _int("CACHE_ZONA_TTL_SEG", 45)
+CACHE_MAX_ENTRADAS = _int("CACHE_MAX_ENTRADAS", 5000)
+
+# Tope de tiempo de respuesta. Vencido, el cliente recibe 504: el trabajo en
+# curso no se puede matar (son subprocesos y drivers sincrónicos), pero termina
+# solo porque cada paso tiene su propio timeout.
+CORTES_TIMEOUT_SEG = _int("CORTES_TIMEOUT_SEG", 25)
+# Requests de cortes que se procesan a la vez. Es control de admisión: por
+# encima de esto encolan y, si no llegan a tiempo, salen por 504 en vez de
+# apilarse compitiendo por las conexiones del pool. Cada request usa como mucho
+# 2 conexiones de zabbix, así que conviene mantenerlo en POOL_MAX/2 o menos.
+CORTES_MAX_CONCURRENTES = _int("CORTES_MAX_CONCURRENTES", 5)
 
 # --- Utilidades del sistema: ping ICMP y SNMP ---
 
