@@ -11,7 +11,7 @@ import logging
 import threading
 import time
 
-from fastapi import Depends, HTTPException
+from fastapi import Depends, HTTPException, Query
 from fastapi.security import APIKeyHeader
 
 import config
@@ -49,18 +49,59 @@ else:
     log.info("API keys cargadas para: %s", ", ".join(sorted(set(_CLAVES.values()))))
 
 
-def verificar_api_key(api_key: str = Depends(api_key_header)) -> str:
-    """Devuelve el nombre del consumidor. 403 si la clave no es válida."""
-    if api_key:
-        # compare_digest contra cada clave: comparar con == filtraría la clave
-        # por diferencias de tiempo.
-        for clave, nombre in _CLAVES.items():
+NO_AUTORIZADO = HTTPException(
+    status_code=403,
+    detail="No autorizado. API Key inválida o ausente en la cabecera X-API-Key.",
+)
+
+
+def _resolver(api_key) -> str | None:
+    """Nombre del consumidor dueño de la clave, o None si no la reconoce."""
+    if not api_key:
+        return None
+    # compare_digest contra cada clave: comparar con == filtraría la clave
+    # por diferencias de tiempo.
+    for clave, nombre in _CLAVES.items():
+        try:
             if hmac.compare_digest(api_key, clave):
                 return nombre
-    raise HTTPException(
-        status_code=403,
-        detail="No autorizado. API Key inválida o ausente en la cabecera X-API-Key.",
-    )
+        except TypeError:
+            # compare_digest solo acepta str ASCII. Una clave con acentos o
+            # emojis reventaría con 500 en vez de 403; llega más fácil por
+            # ?key= que por el header, pero el guard va acá porque es el único
+            # lugar por el que pasan las dos vías.
+            return None
+    return None
+
+
+def verificar_api_key(api_key: str = Depends(api_key_header)) -> str:
+    """Devuelve el nombre del consumidor. 403 si la clave no es válida."""
+    nombre = _resolver(api_key)
+    if nombre:
+        return nombre
+    raise NO_AUTORIZADO
+
+
+def verificar_api_key_docs(
+    api_key: str = Depends(api_key_header),
+    key: str = Query(default=None, description="Alternativa a la cabecera X-API-Key"),
+) -> str:
+    """Igual que `verificar_api_key`, pero acepta la clave también por `?key=`.
+
+    Existe solo para /docs, /redoc y /openapi.json: el navegador no manda
+    cabeceras al tipear una URL, ni el `fetch` con el que Swagger UI se trae el
+    esquema, así que por header la UI es inusable. Los endpoints de negocio
+    siguen exigiendo el header y nada más.
+
+    El precio de aceptarla por query string es que la clave queda escrita en el
+    log de accesos del servidor y en el historial del navegador. Es una clave
+    por consumidor y revocable, así que se acota a rotarla; aun así conviene que
+    la URL con `?key=` no circule por chat ni por tickets.
+    """
+    nombre = _resolver(api_key) or _resolver(key)
+    if nombre:
+        return nombre
+    raise NO_AUTORIZADO
 
 
 class CubetaDeTokens:

@@ -1,14 +1,18 @@
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI
+from urllib.parse import quote
+
+from fastapi import Depends, FastAPI, Query
+from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
+from fastapi.responses import JSONResponse
 
 import config
 import db
 from models import ERRORES_AUTENTICACION
 from routers import analytics, cortes, precinto
 from services import red
-from security import verificar_api_key
+from security import verificar_api_key, verificar_api_key_docs
 
 config.setup_logging()
 log = logging.getLogger(__name__)
@@ -50,8 +54,17 @@ Cada consumidor tiene su propia clave. El nombre asociado aparece en cada línea
 de log y es la unidad del **rate limit**, así que se le puede revocar o limitar a
 uno sin afectar a los demás. Una clave inválida o ausente devuelve `403`.
 
-En Swagger UI, usá el botón **Authorize** para cargar la clave una vez y que
-viaje en todas las pruebas.
+La documentación misma está protegida: `/docs`, `/redoc` y `/openapi.json`
+exigen la clave igual que los endpoints, pero **solo ellas la aceptan también
+por `?key=`**, porque el navegador no puede mandar cabeceras al abrir una URL:
+
+```bash
+# Para bajar el esquema y generar un cliente
+curl -H "X-API-Key: $API_KEY" "http://localhost:8000/openapi.json"
+```
+
+Para abrir esta página en el navegador: `http://localhost:8000/docs?key=<clave>`.
+Tené en cuenta que así la clave queda en el historial y en el log de accesos.
 
 ## Rate limit
 
@@ -137,11 +150,64 @@ app = FastAPI(
     },
     openapi_tags=TAGS_METADATA,
     lifespan=lifespan,
+    # FastAPI monta /docs, /redoc y /openapi.json como rutas propias, sin
+    # dependencias: las de los routers no las alcanzan. Se apagan acá y se
+    # vuelven a montar más abajo detrás de la API key, para que el esquema
+    # —que enumera cada endpoint, parámetro y código de error— no quede
+    # legible para cualquiera que llegue al puerto.
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
 )
 
 app.include_router(precinto.router)
 app.include_router(analytics.router)
 app.include_router(cortes.router)
+
+
+# --- Documentación, detrás de la misma API key que el resto -------------------
+# Estas tres aceptan la clave por cabecera o por `?key=`, a diferencia de los
+# endpoints de negocio, que siguen exigiendo la cabecera. El motivo es que el
+# navegador no manda cabeceras al tipear una URL, ni el `fetch` con el que
+# Swagger UI se trae el esquema: por header la UI no carga.
+
+_RUTA_OPENAPI = "/openapi.json"
+
+
+def _url_openapi(key) -> str:
+    """URL del esquema, arrastrando la clave si vino por query string.
+
+    Sin esto la UI carga pero queda vacía: el `fetch` del esquema saldría sin
+    credencial y se comería un 403.
+    """
+    return f"{_RUTA_OPENAPI}?key={quote(key)}" if key else _RUTA_OPENAPI
+
+
+@app.get(_RUTA_OPENAPI, include_in_schema=False,
+         dependencies=[Depends(verificar_api_key_docs)])
+def openapi_protegido():
+    """Esquema OpenAPI. Requiere `X-API-Key` o `?key=`."""
+    return JSONResponse(app.openapi())
+
+
+@app.get("/docs", include_in_schema=False,
+         dependencies=[Depends(verificar_api_key_docs)])
+def swagger_protegido(key: str = Query(default=None)):
+    """Swagger UI. Requiere `X-API-Key` o `?key=`."""
+    return get_swagger_ui_html(
+        openapi_url=_url_openapi(key),
+        title=f"{app.title} — Swagger UI",
+        # Sin OAuth2 no hace falta la página de redirección que monta FastAPI
+        # por defecto, y con docs_url=None ya no existe.
+        oauth2_redirect_url=None,
+    )
+
+
+@app.get("/redoc", include_in_schema=False,
+         dependencies=[Depends(verificar_api_key_docs)])
+def redoc_protegido(key: str = Query(default=None)):
+    """ReDoc. Requiere `X-API-Key` o `?key=`."""
+    return get_redoc_html(openapi_url=_url_openapi(key), title=f"{app.title} — ReDoc")
 
 
 @app.get(
