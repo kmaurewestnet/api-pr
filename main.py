@@ -66,21 +66,64 @@ curl -H "X-API-Key: $API_KEY" "http://localhost:8000/openapi.json"
 Para abrir esta página en el navegador: `http://localhost:8000/docs?key=<clave>`.
 Tené en cuenta que así la clave queda en el historial y en el log de accesos.
 
+## Modelo de confianza
+
+**No hay filtro por empresa, y es a propósito.** `/precinto` y `/analytics`
+cruzan el parque de las 17 empresas porque esa es su función: son la vista del
+NOC sobre toda la red de acceso, no un portal por cliente. No existe ni está
+previsto un vínculo clave → empresa; si aparece un consumidor que sólo deba ver
+lo suyo, ese recorte va del lado de quien consume, no acá.
+
+Lo que sí se acota es **hasta dónde llega cada clave**. Las internas llegan a
+todo. Las externas —hoy la centralita y el chatbot— se limitan a `/cortes` con
+`API_KEYS_SOLO_CORTES`, porque `/cortes` responde por un cliente puntual y no
+expone el parque de nadie. Con una clave así, cualquier otro endpoint devuelve
+`403`.
+
+| Endpoint | Claves que lo alcanzan | Qué expone |
+|---|---|---|
+| `GET /api/v1/cortes/{n}` | internas y externas | un cliente |
+| `GET /api/v1/precinto/{c}` | sólo internas | una ONU (varias si el código es corto) |
+| `GET /api/v1/empresa/{id}/analytics` | sólo internas | el parque completo de una empresa |
+| `GET /health` | internas y externas | estado del servicio |
+
+El precinto se compara como **texto literal**: los metacaracteres no significan
+nada. Antes se compilaba como expresión regular y quien llamaba elegía el patrón,
+no el valor.
+
 ## Rate limit
 
-El endpoint de cortes descuenta un token por request (cubeta de tokens por
-consumidor, por defecto 60 por minuto). Al agotarse devuelve `429` con la
-cabecera `Retry-After` en segundos.
+Cubeta de tokens **por consumidor**, con dos cuotas separadas:
 
-El límite importa más que en una API común: **un solo request puede disparar
-decenas de consultas SNMP contra una OLT de producción**, así que un loop sobre
-números de cliente le hace DoS a la red, no a la API.
+| Endpoints | Variable | Por defecto |
+|---|---|---|
+| `/cortes` | `RATE_LIMIT_POR_MINUTO` | 60 por minuto |
+| `/precinto` y `/analytics` | `RATE_LIMIT_INTERNO_POR_MINUTO` | 10 por minuto |
+
+Van separadas porque no cuestan lo mismo: una analítica recorre el parque entero
+de la empresa **aunque se pida `limit=1`**, y comparte con `/cortes` el pool de
+conexiones a Zabbix. Que un tablero refrescando no pueda dejar sin atender a la
+centralita es el motivo de que la cuota interna sea la más baja.
+
+`RATE_LIMIT_POR_CONSUMIDOR` le da una cuota distinta a un consumidor puntual
+(`chatbot:20,centralita:120`). Ajusta la cuota de `/cortes`; los endpoints
+internos no se ajustan por consumidor, porque ahí sólo llegan claves internas.
+
+Al agotarse, `429` con la cabecera `Retry-After` en segundos.
+
+El límite importa más que en una API común: **un solo request de `/cortes` puede
+disparar decenas de consultas SNMP contra una OLT de producción**, así que un
+loop sobre números de cliente le hace DoS a la red, no a la API.
+
+Es **en memoria y por proceso**: con N workers de uvicorn el límite efectivo es N
+veces el configurado. Con un solo proceso —como lo levanta el README— el número
+es exacto.
 
 ## Cómo leer los errores
 
 | Código | Significado |
 |---|---|
-| `403` | API Key inválida o ausente |
+| `403` | API Key inválida o ausente, o válida pero sin alcance para ese endpoint |
 | `404` | El recurso no existe o no tiene datos asociados |
 | `422` | Un parámetro no cumple el formato o el rango esperado |
 | `429` | Rate limit del consumidor alcanzado |
@@ -107,7 +150,8 @@ TAGS_METADATA = [
         "description": (
             "Series históricas de **una** ONU identificada por su precinto: "
             "potencia óptica recibida por la ONU y por la OLT, log de causas de "
-            "caída y cambios de estado. Es la vista de diagnóstico fino."
+            "caída y cambios de estado. Es la vista de diagnóstico fino. "
+            "**Interno**: no lo alcanzan las claves externas."
         ),
     },
     {
@@ -115,7 +159,8 @@ TAGS_METADATA = [
         "description": (
             "Estado agregado del **parque completo** de una empresa, con resumen "
             "por categoría y listado paginado de dispositivos. Pensado para "
-            "tableros y reportes de disponibilidad."
+            "tableros y reportes de disponibilidad. **Interno**: no lo "
+            "alcanzan las claves externas."
         ),
     },
     {
@@ -124,7 +169,9 @@ TAGS_METADATA = [
             "Diagnóstico de **un cliente** por su número de contrato: si está "
             "navegando y si el corte afecta a la zona. Contrato de salida cerrado "
             "de tres booleanos, pensado para consumirlo desde un CRM o un bot de "
-            "atención. Es el único grupo con rate limit propio."
+            "atención. Es el único que alcanzan las claves externas, y el que "
+            "amplifica contra la red: un request dispara consultas SNMP contra "
+            "una OLT de producción."
         ),
     },
     {

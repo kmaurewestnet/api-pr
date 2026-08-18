@@ -327,15 +327,41 @@ limit, así que se le puede cortar a un consumidor sin cortarles a todos. La cla
 API_KEYS=facturacion:xxx,soporte:yyy,app-movil:zzz
 ```
 
-El rate limit es una cubeta de tokens por consumidor
-(`RATE_LIMIT_POR_MINUTO`, default 60; `0` desactiva). Devuelve `429` con
-`Retry-After`. Importa más que en una API común por la amplificación: **un
-request puede disparar decenas de consultas SNMP contra una OLT de producción**,
-así que un loop sobre números de cliente le hace DoS a la red, no a la API.
+`API_KEYS_SOLO_CORTES` lista, por nombre, los consumidores que **solo** pueden
+usar `/cortes` — los externos: hoy la centralita y el chatbot. `/precinto` y
+`/analytics` devuelven el parque de las 17 empresas (cruzar empresas es la
+función de esos endpoints, no un descuido), así que son la vista interna del NOC
+y con una clave externa responden `403`. Un nombre que no exista en `API_KEYS` se
+loguea como ERROR al arrancar: sería un consumidor que quedó sin restringir sin
+que nadie se entere.
+
+```
+API_KEYS_SOLO_CORTES=centralita,chatbot
+```
+
+El rate limit es una cubeta de tokens por consumidor, con dos cuotas separadas:
+`RATE_LIMIT_POR_MINUTO` (default 60) para `/cortes`, y
+`RATE_LIMIT_INTERNO_POR_MINUTO` (default 10) para `/precinto` y `/analytics`. En
+`0` se desactiva. Van separadas porque no cuestan lo mismo: una analítica recorre
+el parque entero de la empresa aunque se pida `limit=1` y comparte con `/cortes`
+el pool de Zabbix, así que con una sola cuota un tablero refrescando puede dejar
+sin atender a la centralita.
+
+`RATE_LIMIT_POR_CONSUMIDOR` (`chatbot:20,centralita:120`) le da una cuota propia
+a un consumidor puntual, sobre la cuota general. Los endpoints internos no se
+ajustan por consumidor: ahí solo llegan claves internas.
+
+Devuelve `429` con `Retry-After`. Importa más que en una API común por la
+amplificación: **un request puede disparar decenas de consultas SNMP contra una
+OLT de producción**, así que un loop sobre números de cliente le hace DoS a la
+red, no a la API.
 
 Es en memoria y **por proceso**: con N workers de uvicorn el límite efectivo es N
-veces el configurado. Compartirlo requeriría Redis; para frenar un loop
-accidental o un consumidor desbocado, alcanza.
+veces el configurado. El comando de arriba levanta **un solo proceso**, así que
+el número es exacto; si en producción se agregan workers o se pasa a gunicorn,
+hay que dividir el límite configurado por esa cantidad. Compartirlo entre
+procesos requeriría Redis; para frenar un loop accidental o un consumidor
+desbocado, alcanza.
 
 El endpoint se declara `async def` y todo el trabajo bloqueante va a un
 `ThreadPoolExecutor` propio de `CORTES_MAX_CONCURRENTES` (default 5). Eso da dos
