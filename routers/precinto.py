@@ -5,14 +5,17 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
+import config
 import db
-from models import ERRORES_AUTENTICACION
+from models import ERROR_RATE_LIMIT, ERRORES_AUTENTICACION_INTERNA
 from queries.precinto import QUERY_ESTADO, QUERY_LOGS, QUERY_OLT_RX, QUERY_ONU_RX
-from security import verificar_api_key
+from security import limitar_tasa_interna
 
 log = logging.getLogger(__name__)
 
-router = APIRouter(tags=["precinto"], dependencies=[Depends(verificar_api_key)])
+router = APIRouter(
+    tags=["precinto"], dependencies=[Depends(limitar_tasa_interna)]
+)
 
 
 EJEMPLO_RESPUESTA = {
@@ -54,7 +57,8 @@ EJEMPLO_RESPUESTA = {
             ),
             "content": {"application/json": {"example": EJEMPLO_RESPUESTA}},
         },
-        **ERRORES_AUTENTICACION,
+        **ERRORES_AUTENTICACION_INTERNA,
+        **ERROR_RATE_LIMIT,
         500: {
             "description": "Error inesperado al procesar los datos de Zabbix.",
             "content": {
@@ -101,7 +105,8 @@ def obtener_datos_completos_precinto(
     * `codigo_precinto` (ruta): el precinto de la ONU. Se compara contra el
       nombre del item en Zabbix de forma **insensible a mayúsculas y como
       coincidencia parcial**, así que un precinto corto puede traer datos de
-      varias ONUs. Enviá el código completo para evitarlo.
+      varias ONUs. Enviá el código completo para evitarlo. Se compara como
+      texto literal: los metacaracteres no tienen ningún significado especial.
     * `horas` (query, 1–168, por defecto 6): ventana hacia atrás de las series de
       potencia. **Solo afecta a `onu_rx` y `onu_olt_rx`**; `logs` y `estados` se
       devuelven siempre completos, sin corte temporal.
@@ -123,20 +128,26 @@ def obtener_datos_completos_precinto(
     try:
         with db.zabbix_conn() as conn:
             with db.cursor_pg(conn) as cursor:
+                tope = config.PRECINTO_MAX_FILAS
+
                 # 1. Ejecutar ONU RX (Usa tiempo y precinto)
-                cursor.execute(QUERY_ONU_RX, (start_time, now, codigo_precinto))
+                cursor.execute(
+                    QUERY_ONU_RX, (start_time, now, codigo_precinto, tope)
+                )
                 onu_rx_data = cursor.fetchall()
 
                 # 2. Ejecutar ONU OLT RX (Usa tiempo y precinto)
-                cursor.execute(QUERY_OLT_RX, (start_time, now, codigo_precinto))
+                cursor.execute(
+                    QUERY_OLT_RX, (start_time, now, codigo_precinto, tope)
+                )
                 onu_olt_rx_data = cursor.fetchall()
 
                 # 3. Ejecutar LOGS (Solo usa precinto)
-                cursor.execute(QUERY_LOGS, (codigo_precinto,))
+                cursor.execute(QUERY_LOGS, (codigo_precinto, tope))
                 logs_data = cursor.fetchall()
 
                 # 4. Ejecutar ESTADO (Solo usa precinto)
-                cursor.execute(QUERY_ESTADO, (codigo_precinto,))
+                cursor.execute(QUERY_ESTADO, (codigo_precinto, tope))
                 estado_data = cursor.fetchall()
     except db.DatabaseUnavailable as e:
         log.error("Zabbix no disponible: %s", e)

@@ -447,6 +447,128 @@ def test_api_keys_por_consumidor():
         config.API_KEYS_CRUDO, config.API_KEY_SECRETA = crudo, legacy
 
 
+def test_precinto_no_compila_el_parametro_como_regex():
+    """El precinto lo elige quien llama. Con `~*` no elegia el valor a buscar
+    sino el patron: `^` devolvia el parque entero de las 17 empresas en un solo
+    request y `(` reventaba la consulta con un 500."""
+    from queries import precinto as qp
+
+    consultas = {n: v for n, v in vars(qp).items()
+                 if n.startswith("QUERY_") and isinstance(v, str)}
+    esperado = {"QUERY_ONU_RX": 4, "QUERY_OLT_RX": 4,
+                "QUERY_LOGS": 2, "QUERY_ESTADO": 2}
+    assert set(consultas) == set(esperado), sorted(consultas)
+
+    for nombre, sql in consultas.items():
+        # Ningun operador de regex puede recibir el parametro del usuario.
+        assert not re.search(r"~\*?\s*%s", sql), f"{nombre} matchea %s como regex"
+        assert "strpos(upper(" in sql, f"{nombre} no compara el precinto literal"
+        assert "LIMIT %s" in sql, f"{nombre} quedo sin tope de filas"
+        assert "'%s'" not in sql, f"{nombre} tiene un %s entre comillas"
+        real = sql.count("%s")
+        assert real == esperado[nombre], f"{nombre}: {real} placeholders"
+
+
+def test_limite_propio_por_consumidor():
+    """Los consumidores de /cortes no se parecen entre si: una centralita hace un
+    request por llamada atendida y un chatbot con entrada de usuario puede entrar
+    en loop, y ese loop lo paga la OLT."""
+    import security
+
+    crudo = config.RATE_LIMIT_POR_CONSUMIDOR_CRUDO
+    try:
+        config.RATE_LIMIT_POR_CONSUMIDOR_CRUDO = (
+            " chatbot:2 , centralita:0 ,  , sin-dos-puntos , malo:x , negativo:-1 "
+        )
+        limites = security._cargar_limites({"k1": "chatbot", "k2": "centralita"})
+        # El negativo se descarta y no se toma literal: una tasa <= 0 en la
+        # cubeta significa "sin limite", o sea lo contrario de lo que se quiso.
+        assert limites == {"chatbot": 2, "centralita": 0}, limites
+
+        cubeta = security.CubetaDeTokens(por_minuto=60, burst=60, propios=limites)
+        # El 429 tiene que poder nombrar el limite real, no el general.
+        assert cubeta.por_minuto_de("chatbot") == 2
+        assert cubeta.por_minuto_de("soporte") == 60
+
+        # El chatbot corta a las 2...
+        assert [cubeta.consumir("chatbot")[0] for _ in range(3)] == [True, True, False]
+        # ...sin tocarle la cuota a quien no tiene una propia.
+        assert cubeta.consumir("soporte")[0] is True
+        # 0 es "sin limite", no "bloqueado".
+        assert all(cubeta.consumir("centralita")[0] for _ in range(100))
+    finally:
+        config.RATE_LIMIT_POR_CONSUMIDOR_CRUDO = crudo
+
+
+def test_cortes_y_endpoints_internos_no_comparten_cuota():
+    """Dos cubetas y no una: agotar la de analiticas no puede dejar sin atender
+    a la centralita, que es la que tiene gente esperando del otro lado."""
+    import security
+    from fastapi import HTTPException
+
+    previo = security._limite_interno
+    try:
+        security._limite_interno = security.CubetaDeTokens(por_minuto=60, burst=1)
+        assert security.limitar_tasa_interna("noc") == "noc"
+        try:
+            security.limitar_tasa_interna("noc")
+            assert False, "el segundo request interno tendria que dar 429"
+        except HTTPException as e:
+            assert e.status_code == 429, e.status_code
+            assert e.headers.get("Retry-After"), "el 429 va con Retry-After"
+
+        # La cuota interna quedo agotada, pero /cortes descuenta de la suya.
+        assert security.limitar_tasa("noc") == "noc"
+    finally:
+        security._limite_interno = previo
+
+
+def test_consumidores_externos_solo_llegan_a_cortes():
+    """La centralita y el chatbot son externos: tienen clave propia para /cortes,
+    pero precinto y analiticas devuelven el parque de todas las empresas, que es
+    la vista interna del NOC."""
+    import security
+    from fastapi import HTTPException
+
+    crudo, legacy = config.API_KEYS_CRUDO, config.API_KEY_SECRETA
+    externos = config.CONSUMIDORES_SOLO_CORTES
+    claves_previas, alcance_previo = security._CLAVES, security._SOLO_CORTES
+    try:
+        config.API_KEYS_CRUDO = "noc:clave-noc,chatbot:clave-bot"
+        config.API_KEY_SECRETA = ""
+        config.CONSUMIDORES_SOLO_CORTES = " chatbot , "
+        security._CLAVES = security._cargar_claves()
+        security._SOLO_CORTES = security._cargar_solo_cortes(security._CLAVES)
+        assert security._SOLO_CORTES == {"chatbot"}, security._SOLO_CORTES
+
+        # Los dos entran por la puerta comun: las dos claves son validas, y por
+        # esa puerta pasa /cortes.
+        assert security.verificar_api_key("clave-noc") == "noc"
+        assert security.verificar_api_key("clave-bot") == "chatbot"
+
+        # Pero solo el interno atraviesa la de precinto y analiticas.
+        assert security.verificar_api_key_interna("noc") == "noc"
+        try:
+            security.verificar_api_key_interna("chatbot")
+            assert False, "el consumidor externo tendria que recibir 403"
+        except HTTPException as e:
+            assert e.status_code == 403, e.status_code
+
+        # Un nombre mal escrito no restringe a nadie: por eso se valida contra
+        # las claves cargadas y se loguea. Si esto deja de avisar, el proximo
+        # consumidor externo queda abierto sin que nadie se entere.
+        config.CONSUMIDORES_SOLO_CORTES = "chatbott"
+        assert security._cargar_solo_cortes(security._CLAVES) == {"chatbott"}
+
+        # Sin la variable no cambia nada de lo que ya andaba.
+        config.CONSUMIDORES_SOLO_CORTES = ""
+        assert security._cargar_solo_cortes(security._CLAVES) == frozenset()
+    finally:
+        config.API_KEYS_CRUDO, config.API_KEY_SECRETA = crudo, legacy
+        config.CONSUMIDORES_SOLO_CORTES = externos
+        security._CLAVES, security._SOLO_CORTES = claves_previas, alcance_previo
+
+
 def test_rate_limit_por_consumidor():
     from security import CubetaDeTokens
 

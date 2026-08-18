@@ -56,6 +56,16 @@ API_KEYS_CRUDO = os.getenv("API_KEYS", "")
 # "legacy". Migrar a API_KEYS es lo que da atribución y revocación selectiva.
 API_KEY_SECRETA = os.getenv("API_KEY_SECRETA", "")
 
+# Consumidores que solo pueden usar /api/v1/cortes: la centralita y el chatbot.
+# El resto de los endpoints devuelve el parque completo de todas las empresas
+# —cruzar empresas es la funcion del endpoint, no un descuido—, asi que es la
+# vista interna del NOC y no algo que corresponda entregar afuera.
+#
+# Se listan por nombre y no por clave, ni como un campo mas de API_KEYS, porque
+# la clave admite ':' (ver security._cargar_claves): un tercer campo posicional
+# romperia las claves que ya lo usan.
+CONSUMIDORES_SOLO_CORTES = os.getenv("API_KEYS_SOLO_CORTES", "")
+
 # Rate limit por consumidor, cubeta de tokens. En 0 se desactiva.
 # Importa más que en una API común: un request puede disparar decenas de
 # consultas SNMP contra una OLT de producción, así que un loop sobre números de
@@ -63,6 +73,33 @@ API_KEY_SECRETA = os.getenv("API_KEY_SECRETA", "")
 RATE_LIMIT_POR_MINUTO = _int("RATE_LIMIT_POR_MINUTO", 60)
 # Ráfaga tolerada. Por defecto, un minuto entero de golpe.
 RATE_LIMIT_BURST = _int("RATE_LIMIT_BURST", RATE_LIMIT_POR_MINUTO)
+
+# Rate limit propio de los endpoints internos (precinto y analiticas). Va aparte
+# y mucho mas bajo que el de cortes porque el costo por request es otro: una
+# analitica recorre el parque entero de la empresa —varios segundos y dos
+# conexiones de zabbix, aunque se pida limit=1— y una busqueda de precinto corta
+# barre el historico. Sesenta de esas por minuto dejan sin conexiones al pool que
+# /cortes necesita para atender a la centralita y al chatbot.
+RATE_LIMIT_INTERNO_POR_MINUTO = _int("RATE_LIMIT_INTERNO_POR_MINUTO", 10)
+RATE_LIMIT_INTERNO_BURST = _int(
+    "RATE_LIMIT_INTERNO_BURST", RATE_LIMIT_INTERNO_POR_MINUTO
+)
+
+# Limite propio para consumidores puntuales: `nombre:por_minuto` separados por
+# coma. Lo que no aparezca usa RATE_LIMIT_POR_MINUTO. Ajusta la cuota general —la
+# de /cortes—, no la interna: a precinto y analiticas solo llegan claves
+# internas, que ya comparten un unico limite bajo.
+#
+# Existe porque los consumidores de /cortes no se parecen entre si: una centralita
+# hace un request por llamada atendida, y un chatbot con entrada de usuario puede
+# entrar en loop. El costo real de ese loop no lo paga la API sino la OLT.
+RATE_LIMIT_POR_CONSUMIDOR_CRUDO = os.getenv("RATE_LIMIT_POR_CONSUMIDOR", "")
+
+# Tope de filas por serie del endpoint de precinto. Una ONU sola en la ventana
+# maxima (168 h, lecturas por minuto) da ~10.000 puntos, asi que el tope no toca
+# el caso legitimo: acota lo que puede arrastrar una busqueda parcial corta que
+# matchee muchas ONUs.
+PRECINTO_MAX_FILAS = _int("PRECINTO_MAX_FILAS", 50000)
 
 # --- Bases de datos ---
 # Zabbix conserva los nombres de variable originales para no romper el .env en

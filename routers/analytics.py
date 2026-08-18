@@ -7,13 +7,19 @@ from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from fastapi.responses import StreamingResponse
 
 import db
-from models import ERRORES_AUTENTICACION, AnalyticsResponse
-from security import verificar_api_key
+from models import (
+    ERROR_RATE_LIMIT,
+    ERRORES_AUTENTICACION_INTERNA,
+    AnalyticsResponse,
+)
+from security import limitar_tasa_interna
 from services import analytics as svc
 
 log = logging.getLogger(__name__)
 
-router = APIRouter(tags=["analiticas"], dependencies=[Depends(verificar_api_key)])
+router = APIRouter(
+    tags=["analiticas"], dependencies=[Depends(limitar_tasa_interna)]
+)
 
 ESTADOS = svc.CATEGORIAS
 
@@ -52,7 +58,8 @@ def _stream(metadata, resumen, dispositivos):
                 "en `null`."
             )
         },
-        **ERRORES_AUTENTICACION,
+        **ERRORES_AUTENTICACION_INTERNA,
+        **ERROR_RATE_LIMIT,
         404: {
             "description": "La empresa no tiene dispositivos asociados en napear.",
             "content": {

@@ -39,7 +39,64 @@ def _cargar_claves() -> dict:
     return claves
 
 
+def _cargar_solo_cortes(claves: dict) -> frozenset:
+    """Nombres de los consumidores limitados al endpoint de cortes.
+
+    Un nombre mal escrito no rompe nada visible: el consumidor queda sin
+    restringir y nadie se entera hasta que pide el parque entero. Es justo la
+    falla que esto viene a evitar, asi que se valida contra las claves cargadas
+    y se grita al arrancar.
+    """
+    nombres = frozenset(
+        n.strip() for n in config.CONSUMIDORES_SOLO_CORTES.split(",") if n.strip()
+    )
+    desconocidos = nombres - set(claves.values())
+    if desconocidos:
+        log.error(
+            "API_KEYS_SOLO_CORTES nombra consumidores que no estan en API_KEYS, "
+            "quedan SIN restringir: %s", ", ".join(sorted(desconocidos)),
+        )
+    return nombres
+
+
+def _cargar_limites(claves: dict) -> dict:
+    """{consumidor: consultas_por_minuto}. Lo no listado usa el limite general."""
+    limites = {}
+    for entrada in config.RATE_LIMIT_POR_CONSUMIDOR_CRUDO.split(","):
+        entrada = entrada.strip()
+        if not entrada:
+            continue
+        nombre, sep, valor = entrada.partition(":")
+        nombre = nombre.strip()
+        try:
+            if not sep or not nombre:
+                raise ValueError("falta el nombre o los dos puntos")
+            por_minuto = int(valor.strip())
+            # Un negativo daria tasa <= 0, que en la cubeta significa "sin
+            # limite": justo lo contrario de lo que quiso escribir quien lo puso.
+            if por_minuto < 0:
+                raise ValueError("no puede ser negativo (0 es sin limite)")
+            limites[nombre] = por_minuto
+        except ValueError as e:
+            log.error(
+                "Entrada mal formada en RATE_LIMIT_POR_CONSUMIDOR (%s), se "
+                "ignora: %r", e, entrada,
+            )
+    desconocidos = set(limites) - set(claves.values())
+    if desconocidos:
+        log.error(
+            "RATE_LIMIT_POR_CONSUMIDOR nombra consumidores que no estan en "
+            "API_KEYS, no le aplican a nadie: %s", ", ".join(sorted(desconocidos)),
+        )
+    return limites
+
+
 _CLAVES = _cargar_claves()
+_SOLO_CORTES = _cargar_solo_cortes(_CLAVES)
+_LIMITES_PROPIOS = _cargar_limites(_CLAVES)
+
+if _SOLO_CORTES:
+    log.info("Limitados a /cortes: %s", ", ".join(sorted(_SOLO_CORTES)))
 
 if not _CLAVES:
     # Falla cerrado: sin claves, todo request da 403. Mejor verlo al arrancar
@@ -52,6 +109,11 @@ else:
 NO_AUTORIZADO = HTTPException(
     status_code=403,
     detail="No autorizado. API Key inválida o ausente en la cabecera X-API-Key.",
+)
+
+FUERA_DE_ALCANCE = HTTPException(
+    status_code=403,
+    detail="Esta clave solo tiene acceso al endpoint de cortes.",
 )
 
 
@@ -80,6 +142,25 @@ def verificar_api_key(api_key: str = Depends(api_key_header)) -> str:
     if nombre:
         return nombre
     raise NO_AUTORIZADO
+
+
+def verificar_api_key_interna(consumidor: str = Depends(verificar_api_key)) -> str:
+    """Igual que `verificar_api_key`, pero le cierra la puerta a los externos.
+
+    Precinto y analiticas devuelven el parque de todas las empresas: es la vista
+    del NOC. La centralita y el chatbot solo necesitan preguntar por un cliente,
+    y para eso les alcanza /cortes.
+
+    Va como dependencia de esos dos routers y no como un chequeo dentro de cada
+    handler para que agregar un endpoint interno nuevo lo herede sin que nadie
+    se tenga que acordar.
+    """
+    if consumidor in _SOLO_CORTES:
+        log.warning(
+            "'%s' pidio un endpoint interno; su alcance es solo /cortes", consumidor
+        )
+        raise FUERA_DE_ALCANCE
+    return consumidor
 
 
 def verificar_api_key_docs(
@@ -112,41 +193,75 @@ class CubetaDeTokens:
     nueva; para frenar un loop accidental o un consumidor desbocado alcanza.
     """
 
-    def __init__(self, por_minuto: int, burst: int):
-        self._tasa = por_minuto / 60.0
-        self._capacidad = max(1, burst)
+    def __init__(self, por_minuto: int, burst: int, propios: dict | None = None):
+        self._defecto = (por_minuto / 60.0, max(1, burst))
+        # El burst propio sale del mismo numero: darle 120/min a un consumidor y
+        # dejarle la rafaga del default no es lo que se pidio.
+        self._propios = {
+            nombre: (pm / 60.0, max(1, pm)) for nombre, pm in (propios or {}).items()
+        }
         self._estado = {}          # consumidor -> (tokens, ultima_recarga)
         self._lock = threading.Lock()
 
+    def _cuota(self, consumidor: str):
+        """(tasa, capacidad) del consumidor, o la general si no tiene propia."""
+        return self._propios.get(consumidor, self._defecto)
+
+    def por_minuto_de(self, consumidor: str) -> int:
+        """Limite efectivo, para poder nombrarlo en el 429 sin mentir."""
+        return round(self._cuota(consumidor)[0] * 60)
+
     def consumir(self, consumidor: str):
         """(permitido, segundos_de_espera)."""
-        if self._tasa <= 0:
+        tasa, capacidad = self._cuota(consumidor)
+        if tasa <= 0:
             return True, 0.0
         ahora = time.monotonic()
         with self._lock:
-            tokens, ultimo = self._estado.get(consumidor, (self._capacidad, ahora))
-            tokens = min(self._capacidad, tokens + (ahora - ultimo) * self._tasa)
+            tokens, ultimo = self._estado.get(consumidor, (capacidad, ahora))
+            tokens = min(capacidad, tokens + (ahora - ultimo) * tasa)
             if tokens < 1:
                 self._estado[consumidor] = (tokens, ahora)
-                return False, (1 - tokens) / self._tasa
+                return False, (1 - tokens) / tasa
             self._estado[consumidor] = (tokens - 1, ahora)
             return True, 0.0
 
 
-_limite = CubetaDeTokens(config.RATE_LIMIT_POR_MINUTO, config.RATE_LIMIT_BURST)
+# Dos cubetas separadas y no una compartida: un request de cortes y uno de
+# analiticas no cuestan lo mismo ni presionan lo mismo, asi que tampoco tienen
+# por que descontar de la misma cuota.
+_limite = CubetaDeTokens(
+    config.RATE_LIMIT_POR_MINUTO, config.RATE_LIMIT_BURST, _LIMITES_PROPIOS
+)
+# La cuota interna no se ajusta por consumidor: ahi solo llegan claves internas.
+_limite_interno = CubetaDeTokens(
+    config.RATE_LIMIT_INTERNO_POR_MINUTO, config.RATE_LIMIT_INTERNO_BURST
+)
+
+
+def _descontar(cubeta: CubetaDeTokens, consumidor: str) -> str:
+    permitido, espera = cubeta.consumir(consumidor)
+    if not permitido:
+        limite = cubeta.por_minuto_de(consumidor)
+        log.warning("Rate limit alcanzado por '%s' (%s/min)", consumidor, limite)
+        raise HTTPException(
+            status_code=429,
+            detail=f"Límite de {limite} consultas por minuto alcanzado",
+            headers={"Retry-After": str(max(1, round(espera)))},
+        )
+    return consumidor
 
 
 def limitar_tasa(consumidor: str = Depends(verificar_api_key)) -> str:
     """Valida la clave y descuenta un token. Devuelve el nombre del consumidor."""
-    permitido, espera = _limite.consumir(consumidor)
-    if not permitido:
-        log.warning("Rate limit alcanzado por '%s'", consumidor)
-        raise HTTPException(
-            status_code=429,
-            detail=(
-                f"Límite de {config.RATE_LIMIT_POR_MINUTO} consultas por minuto "
-                "alcanzado"
-            ),
-            headers={"Retry-After": str(max(1, round(espera)))},
-        )
-    return consumidor
+    return _descontar(_limite, consumidor)
+
+
+def limitar_tasa_interna(consumidor: str = Depends(verificar_api_key_interna)) -> str:
+    """Alcance interno + cuota propia, para precinto y analiticas.
+
+    Es lo que evita que un uso interno pesado —no hace falta que sea malicioso,
+    alcanza con un tablero refrescando— le coma a /cortes las conexiones de
+    zabbix que comparten.
+    """
+    return _descontar(_limite_interno, consumidor)

@@ -38,6 +38,16 @@ ERRORES_AUTENTICACION = {
     ),
 }
 
+# Precinto y analiticas suman un segundo motivo de 403: la clave es valida pero
+# es la de un consumidor externo, limitado a /cortes.
+ERRORES_AUTENTICACION_INTERNA = {
+    403: _error(
+        "API Key ausente o inválida, o válida pero de un consumidor externo: "
+        "`/precinto` y `/analytics` son endpoints internos del NOC.",
+        "Esta clave solo tiene acceso al endpoint de cortes.",
+    ),
+}
+
 ERROR_RATE_LIMIT = {
     429: _error(
         "Rate limit del consumidor alcanzado. La respuesta incluye la cabecera "
