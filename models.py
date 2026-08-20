@@ -1,4 +1,5 @@
-"""Modelos de respuesta de los endpoints (documentan /docs)."""
+"""Modelos de respuesta de los endpoints. Definen el esquema publicado en
+/docs, /redoc y /openapi.json."""
 from typing import List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -13,8 +14,8 @@ class ErrorDetalle(BaseModel):
     """Cuerpo de cualquier respuesta de error de la API."""
 
     detail: str = Field(
-        description="Motivo del rechazo, en texto legible. Es el mismo valor que "
-                    "viaja en el `detail` de la HTTPException del servidor.",
+        description="Motivo del rechazo, en texto legible. Corresponde al valor "
+                    "del campo `detail` de la HTTPException emitida por el servidor.",
         examples=["No autorizado. API Key inválida o ausente en la cabecera X-API-Key."],
     )
 
@@ -42,8 +43,8 @@ ERRORES_AUTENTICACION = {
 # es la de un consumidor externo, limitado a /cortes.
 ERRORES_AUTENTICACION_INTERNA = {
     403: _error(
-        "API Key ausente o inválida, o válida pero de un consumidor externo: "
-        "`/precinto` y `/analytics` son endpoints internos del NOC.",
+        "API Key ausente o inválida, o válida pero correspondiente a un "
+        "consumidor externo: `/precinto` y `/analytics` son endpoints internos.",
         "Esta clave solo tiene acceso al endpoint de cortes.",
     ),
 }
@@ -65,8 +66,8 @@ class RangoTiempo(BaseModel):
 
     desde_timestamp: Optional[int] = Field(
         default=None,
-        description="Epoch del inicio de la ventana. `null` cuando no se acotó la "
-                    "antigüedad (sin el parámetro `horas`).",
+        description="Epoch de inicio de la ventana. `null` cuando no se acotó la "
+                    "antigüedad, es decir, sin el parámetro `horas`.",
         examples=[None],
     )
     hasta_timestamp: int = Field(
@@ -75,8 +76,8 @@ class RangoTiempo(BaseModel):
     )
     horas_consultadas: Optional[int] = Field(
         default=None,
-        description="Valor del parámetro `horas` con el que se resolvió la "
-                    "consulta. `null` si no se envió.",
+        description="Valor del parámetro `horas` aplicado en la consulta. `null` "
+                    "si no se envió.",
         examples=[None],
     )
 
@@ -91,19 +92,19 @@ class Paginacion(BaseModel):
     page: int = Field(description="Página devuelta.", examples=[1])
     limit: int = Field(description="Tamaño de página solicitado.", examples=[20])
     total_items: int = Field(
-        description="Dispositivos tras aplicar el filtro `?estado`.",
+        description="Dispositivos resultantes tras aplicar el filtro `?estado`.",
         examples=[251],
     )
     total_paginas: int = Field(
         description="Páginas necesarias para recorrer `total_items`. Con 0 items "
-                    "es 1 (una página vacía), no 0.",
+                    "su valor es 1, correspondiente a una página vacía, no 0.",
         examples=[13],
     )
 
 
 class Metadata(BaseModel):
-    """Contexto de la consulta: qué empresa, cuántos registros trajo cada base
-    y con qué recorte se devuelve el listado."""
+    """Contexto de la consulta: empresa consultada, registros aportados por cada
+    base y recorte aplicado al listado."""
 
     empresa_id: int = Field(
         description="ID de empresa consultado, tal como llegó en la ruta.",
@@ -111,16 +112,17 @@ class Metadata(BaseModel):
     )
     empresa: Optional[str] = Field(
         default=None,
-        description="Razón social según napear. `null` si la empresa no tiene "
-                    "nombre cargado.",
-        examples=["CMC Network"],
+        description="Razón social registrada en el sistema de reservas. `null` si "
+                    "la empresa no tiene nombre cargado.",
+        examples=["Empresa Ejemplo S.A."],
     )
     total_seriales_napear: int = Field(
-        description="Seriales devueltos por napear.", examples=[252]
+        description="Seriales aportados por el sistema de reservas.", examples=[252]
     )
     total_onus: int = Field(
-        description="ONUs encontradas en soldef. Suele ser menor que "
-                    "`total_seriales_napear`: hay seriales sin boca asociada.",
+        description="ONUs localizadas en el inventario de red. Habitualmente es "
+                    "menor que `total_seriales_napear`, dado que existen seriales "
+                    "sin boca asociada.",
         examples=[251],
     )
     rango_tiempo: RangoTiempo
@@ -131,24 +133,25 @@ class Metadata(BaseModel):
 
 
 class OrigenEstado(BaseModel):
-    """De dónde salió el estado del parque, en conteos.
+    """Origen del estado del parque, expresado en conteos.
 
-    Sirve para juzgar la muestra: mayoría de `los` significa que el estado es un
-    proxy de la fibra, no del servicio.
+    Permite evaluar la composición de la muestra: un predominio de `los` indica
+    que el estado es un proxy del enlace de fibra, no del servicio.
     """
 
     onlinestate: int = Field(
-        description="Equipos cuyo estado se tomó del item `OnlineState` "
-                    "(fuente autoritativa).",
+        description="Equipos cuyo estado se obtuvo del item `OnlineState`, la "
+                    "fuente autoritativa.",
         examples=[490],
     )
     los: int = Field(
-        description="Equipos cuyo estado se derivó de la alarma óptica, porque "
-                    "no tienen item `OnlineState`.",
+        description="Equipos cuyo estado se derivó de la alarma óptica, por no "
+                    "disponer del item `OnlineState`.",
         examples=[0],
     )
     sin_datos: int = Field(
-        description="Equipos sin ninguna de las dos fuentes.", examples=[1]
+        description="Equipos que no disponen de ninguna de las dos fuentes.",
+        examples=[1],
     )
 
 
@@ -165,20 +168,24 @@ class Resumen(BaseModel):
     )
     online: int = Field(description="La ONT reporta `Online`.", examples=[446])
     offline: int = Field(
-        description="Caída sin dying-gasp reciente ni LOS vigente.", examples=[34]
+        description="Caída sin dying-gasp reciente ni alarma LOS vigente.",
+        examples=[34],
     )
     los: int = Field(
         description="Caída con alarma óptica de menos de 7 días "
-                    "(`LOS_VIGENTE_DIAS`). Corte de fibra: necesita cuadrilla.",
+                    "(`LOS_VIGENTE_DIAS`). Corte de fibra: requiere intervención "
+                    "de cuadrilla.",
         examples=[6],
     )
     powerfail: int = Field(
         description="Caída con Dying-gasp a menos de 15 min del corte "
-                    "(`VENTANA_POWERFAIL_SEG`). Corte de energía en el domicilio.",
+                    "(`VENTANA_POWERFAIL_SEG`). Corresponde a un corte de energía "
+                    "en el domicilio.",
         examples=[4],
     )
     sin_datos: int = Field(
-        description="Sin item de estado ni de LOS con lecturas.", examples=[1]
+        description="Sin lecturas en el item de estado ni en el de LOS.",
+        examples=[1],
     )
     porcentaje_online: Optional[float] = Field(
         default=None,
@@ -190,36 +197,41 @@ class Resumen(BaseModel):
 
 
 class Dispositivo(BaseModel):
-    """Una ONU del parque, ya cruzada entre napear, soldef y Zabbix."""
+    """Una ONU del parque, con los datos ya cruzados entre las tres bases de
+    origen."""
 
     serial: Optional[int] = Field(
         default=None,
-        description="`external_connector_id` de napear = boca de soldef.",
+        description="Identificador de conector del sistema de reservas, "
+                    "equivalente a la boca del inventario de red.",
         examples=[2464596],
     )
     nombre: Optional[str] = Field(
-        default=None, description="`nap_tag` de napear.", examples=["JN-018"]
+        default=None,
+        description="Etiqueta de NAP registrada en el sistema de reservas.",
+        examples=["JN-018"],
     )
     mac: Optional[str] = Field(
         default=None,
-        description="Informativa: no participa del cruce con Zabbix.",
+        description="Informativa: no participa del cruce con el sistema de "
+                    "monitoreo.",
         examples=["48575443ED3C75AA"],
     )
     precinto: Optional[str] = Field(
         default=None,
-        description="Clave de cruce contra `items.name` en Zabbix.",
+        description="Clave de cruce contra el nombre del item de monitoreo.",
         examples=["JES0037"],
     )
     status: Optional[str] = Field(
         default=None,
         description="Último valor del item `OnlineState`. `null` si la ONU no "
-                    "tiene ese item.",
+                    "dispone de ese item.",
         examples=["Online"],
     )
     status_timestamp: Optional[int] = Field(
         default=None,
-        description="Epoch de la lectura de `status`. Sirve para juzgar qué tan "
-                    "fresco es el dato.",
+        description="Epoch de la lectura de `status`. Permite evaluar la vigencia "
+                    "del dato.",
         examples=[1784886153],
     )
     los: Optional[str] = Field(
@@ -234,13 +246,14 @@ class Dispositivo(BaseModel):
     )
     ldc: Optional[str] = Field(
         default=None,
-        description="Última causa de caída, ej. 'Dying-gasp'.",
+        description="Última causa de caída informada por el equipo, por ejemplo "
+                    "'Dying-gasp'.",
         examples=["Dying-gasp"],
     )
     ldc_timestamp: Optional[int] = Field(
         default=None,
-        description="Epoch del momento de la caída, parseado del propio valor. "
-                    "null si la fecha embebida viene malformada.",
+        description="Epoch del momento de la caída, derivado del propio valor. "
+                    "`null` si la fecha embebida está malformada.",
         examples=[1784326271],
     )
     categoria: str = Field(
@@ -249,18 +262,20 @@ class Dispositivo(BaseModel):
     )
     estado: str = Field(
         description="online | offline | sin_datos. Se mantiene por compatibilidad "
-                    "con la primera versión; `categoria` es más específico.",
+                    "con la primera versión de la API; `categoria` ofrece mayor "
+                    "granularidad.",
         examples=["online"],
     )
     origen_estado: Optional[str] = Field(
         default=None,
-        description="De dónde salió 'estado': 'onlinestate' (item autoritativo) o "
-                    "'los' (derivado de la alarma óptica). null si es sin_datos.",
+        description="Origen del campo 'estado': 'onlinestate' (item autoritativo) "
+                    "o 'los' (derivado de la alarma óptica). `null` cuando la "
+                    "categoría es sin_datos.",
         examples=["onlinestate"],
     )
     con_los: bool = Field(
-        description="Alarma óptica activa, sin importar su antigüedad. A "
-                    "diferencia de la categoría `los`, no aplica el corte de "
+        description="Alarma óptica activa, con independencia de su antigüedad. A "
+                    "diferencia de la categoría `los`, no aplica el umbral de "
                     "7 días.",
         examples=[False],
     )
@@ -276,7 +291,7 @@ class AnalyticsResponse(BaseModel):
                 "status": "success",
                 "metadata": {
                     "empresa_id": 34,
-                    "empresa": "CMC Network",
+                    "empresa": "Empresa Ejemplo S.A.",
                     "total_seriales_napear": 252,
                     "total_onus": 251,
                     "rango_tiempo": {
@@ -324,13 +339,15 @@ class AnalyticsResponse(BaseModel):
     )
 
     status: str = Field(
-        description="Siempre 'success' en un 200. Los errores no usan este modelo.",
+        description="Siempre 'success' en una respuesta 200. Las respuestas de "
+                    "error no utilizan este modelo.",
         examples=["success"],
     )
     metadata: Metadata
     resumen: Resumen
     dispositivos: List[Dispositivo] = Field(
-        description="Página del listado, o el parque entero si se pidió `full=true`."
+        description="Página del listado, o el parque completo si se solicitó "
+                    "`full=true`."
     )
 
 
@@ -339,8 +356,8 @@ class AnalyticsResponse(BaseModel):
 
 class CorteResponse(BaseModel):
     """Salida del endpoint de cortes. Contrato cerrado: exactamente estos tres
-    campos, sin envoltorio ni metadata. El detalle de cada verificación queda en
-    el log del servidor, no en la respuesta."""
+    campos, sin envoltorio ni metadata. El detalle de cada verificación se
+    registra en el log del servidor, no en la respuesta."""
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -349,16 +366,18 @@ class CorteResponse(BaseModel):
     )
 
     isFtth: bool = Field(
-        description="El plan activo es de fibra: category_id 16. 17 es wireless",
+        description="El plan activo es de fibra (`category_id` 16). El valor 17 "
+                    "corresponde a wireless.",
         examples=[True],
     )
     isOnline: bool = Field(
-        description="False solo si el ping al cliente falla y la ONT reporta "
-                    "LOS/Offline. En wireless, es el ping al cliente.",
+        description="`false` únicamente si el ping al cliente falla y la ONT "
+                    "reporta LOS/Offline. En wireless se determina por el ping al "
+                    "cliente.",
         examples=[False],
     )
     isZoneIncident: bool = Field(
-        description="Fibra: NAP en corte, o la OLT no responde. "
-                    "Wireless: el AP o el RouterBoard del nodo no responden.",
+        description="Fibra: la NAP está en corte, o la OLT no responde. Wireless: "
+                    "el AP o el RouterBoard del nodo no responden.",
         examples=[True],
     )

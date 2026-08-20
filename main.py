@@ -29,116 +29,123 @@ async def lifespan(app: FastAPI):
 
 
 DESCRIPCION = """
-API de monitoreo de red de acceso: consulta el estado de las ONUs de fibra
-(GPON) y de los enlaces wireless cruzando **cinco bases de datos** que no
-admiten JOIN entre sí, más verificaciones en vivo por `ping` ICMP y `snmpget`
-contra las OLT.
+API de monitoreo de red de acceso. Expone el estado de las ONUs de fibra (GPON)
+y de los enlaces wireless mediante el cruce de **cinco bases de datos** que no
+admiten JOIN entre sí, complementado con verificaciones en vivo por `ping` ICMP
+y `snmpget` contra las OLT.
 
 ## Endpoints
 
-| Endpoint | Alcance | Caso de uso típico |
+| Endpoint | Alcance | Caso de uso |
 |---|---|---|
-| `GET /api/v1/precinto/{codigo}` | Una ONU | Diagnóstico fino: series históricas de potencia óptica, logs y estados |
-| `GET /api/v1/empresa/{id}/analytics` | Parque completo de una empresa | Tableros, reportes de disponibilidad, auditoría de cobertura |
-| `GET /api/v1/cortes/{numero_cliente}` | Un cliente | Atención al cliente: ¿está caído? ¿es un corte de zona? |
-| `GET /health` | La API misma | Monitoreo del servicio y de sus dependencias |
+| `GET /api/v1/precinto/{codigo}` | Una ONU | Diagnóstico detallado: series históricas de potencia óptica, registros de caída y estados |
+| `GET /api/v1/empresa/{id}/analytics` | Parque completo de una empresa | Tableros, reportes de disponibilidad y auditoría de cobertura |
+| `GET /api/v1/cortes/{numero_cliente}` | Un cliente | Atención al cliente: determinar si el servicio está interrumpido y si la falla es de zona |
+| `GET /health` | La API | Monitoreo del servicio y de sus dependencias |
 
 ## Autenticación
 
-Todos los endpoints —incluido `/health`— exigen la cabecera `X-API-Key`.
+Todos los endpoints, incluido `/health`, requieren la cabecera `X-API-Key`.
 
 ```bash
 curl -H "X-API-Key: $API_KEY" "http://localhost:8000/api/v1/cortes/302381"
 ```
 
-Cada consumidor tiene su propia clave. El nombre asociado aparece en cada línea
-de log y es la unidad del **rate limit**, permitiendo revocar o limitar
-individualmente sin afectar a los demás. Una clave inválida o ausente devuelve
-`403`.
+Cada consumidor dispone de una clave propia. El nombre asociado se registra en
+cada línea de log y constituye la unidad del **rate limit**, lo que permite
+revocar o limitar consumidores de forma individual. Una clave inválida o ausente
+produce `403`.
 
-La documentación está protegida: `/docs`, `/redoc` y `/openapi.json` exigen la
-clave igual que los endpoints, pero **solo ellas la aceptan también por
-`?key=`**, porque el navegador no puede enviar cabeceras al abrir una URL.
+La documentación también está protegida: `/docs`, `/redoc` y `/openapi.json`
+requieren la clave en las mismas condiciones que el resto de los endpoints, con
+la diferencia de que **únicamente estas tres la aceptan por `?key=`**, dado que
+el navegador no envía cabeceras al abrir una URL.
 
-Para abrir esta página en el navegador: `http://localhost:8000/docs?key=<clave>`.
-Tené en cuenta que así la clave queda en el historial y en el log de accesos.
+Acceso desde el navegador: `http://localhost:8000/docs?key=<clave>`. Debe
+tenerse en cuenta que, por esa vía, la clave queda registrada en el historial
+del navegador y en el log de accesos del servidor.
 
 ## Modelo de acceso
 
-**No hay filtro por empresa, y es a propósito.** `/precinto` y `/analytics`
-cruzan el parque de las 17 empresas porque esa es su función: son la vista del
-equipo de operaciones sobre toda la red de acceso, no un portal por cliente. No
-existe vínculo clave → empresa; si aparece un consumidor que sólo deba ver lo
-suyo, ese recorte va del lado de quien consume, no acá.
+**No se aplica filtro por empresa, y es una decisión deliberada.** `/precinto` y
+`/analytics` abarcan el parque de las 17 empresas porque esa es su función:
+constituyen la vista del equipo de operaciones sobre la totalidad de la red de
+acceso, no un portal por cliente. No existe vinculación entre clave y empresa;
+si un consumidor debe ver únicamente su propio parque, ese recorte corresponde
+al sistema consumidor.
 
-Lo que sí se acota es **hasta dónde llega cada clave**. Las claves internas
-acceden a todo. Las externas se limitan a `/cortes` con `API_KEYS_SOLO_CORTES`,
-porque `/cortes` responde por un cliente puntual y no expone el parque de nadie.
-Con una clave externa, cualquier otro endpoint devuelve `403`.
+Lo que sí se acota es **el alcance de cada clave**. Las claves internas acceden
+a la totalidad de los endpoints. Las externas quedan limitadas a `/cortes`
+mediante `API_KEYS_SOLO_CORTES`, dado que `/cortes` responde por un cliente
+puntual y no expone el parque de ninguna empresa. Con una clave externa,
+cualquier otro endpoint responde `403`.
 
-| Endpoint | Claves que lo alcanzan | Qué expone |
+| Endpoint | Claves habilitadas | Alcance de la información |
 |---|---|---|
 | `GET /api/v1/cortes/{n}` | internas y externas | un cliente |
-| `GET /api/v1/precinto/{c}` | sólo internas | una ONU (varias si el código es corto) |
+| `GET /api/v1/precinto/{c}` | sólo internas | una ONU (varias si el código es parcial) |
 | `GET /api/v1/empresa/{id}/analytics` | sólo internas | el parque completo de una empresa |
 | `GET /health` | internas y externas | estado del servicio |
 
-El precinto se compara como **texto literal**: los metacaracteres no significan
-nada.
+El precinto se compara como **texto literal**: los metacaracteres carecen de
+significado especial.
 
 ## Rate limit
 
-Cubeta de tokens **por consumidor**, con dos cuotas separadas:
+Cubeta de tokens **por consumidor**, con dos cuotas independientes:
 
-| Endpoints | Variable | Por defecto |
+| Endpoints | Variable | Valor por defecto |
 |---|---|---|
 | `/cortes` | `RATE_LIMIT_POR_MINUTO` | 60 por minuto |
 | `/precinto` y `/analytics` | `RATE_LIMIT_INTERNO_POR_MINUTO` | 10 por minuto |
 
-Van separadas porque no cuestan lo mismo: una analítica recorre el parque
-entero de la empresa **aunque se pida `limit=1`**, y comparte con `/cortes` el
-pool de conexiones al sistema de monitoreo. Que un tablero refrescando no pueda
-dejar sin atender a otros consumidores es el motivo de que la cuota interna sea
-la más baja.
+Las cuotas están separadas porque el costo de cada operación difiere: una
+consulta analítica recorre el parque completo de la empresa **incluso cuando se
+solicita `limit=1`**, y comparte con `/cortes` el pool de conexiones al sistema
+de monitoreo. La cuota interna es la más baja para evitar que un tablero con
+refresco automático degrade la atención del resto de los consumidores.
 
-`RATE_LIMIT_POR_CONSUMIDOR` le da una cuota distinta a un consumidor puntual
-(`consumidor_a:20,consumidor_b:120`). Ajusta la cuota de `/cortes`; los
-endpoints internos no se ajustan por consumidor, porque ahí sólo llegan claves
-internas.
+`RATE_LIMIT_POR_CONSUMIDOR` asigna una cuota diferenciada a un consumidor
+puntual (`consumidor_a:20,consumidor_b:120`). Solo ajusta la cuota de `/cortes`;
+los endpoints internos no admiten ajuste por consumidor, dado que únicamente los
+alcanzan claves internas.
 
-Al agotarse, `429` con la cabecera `Retry-After` en segundos.
+Al agotarse la cuota se responde `429` con la cabecera `Retry-After` expresada
+en segundos.
 
-El límite importa más que en una API común: **un solo request de `/cortes` puede
-disparar decenas de consultas SNMP contra una OLT de producción**, así que un
-loop sobre números de cliente le hace DoS a la red, no a la API.
+El límite tiene mayor relevancia que en una API convencional: **un único request
+a `/cortes` puede originar decenas de consultas SNMP contra una OLT en
+producción**, por lo que una iteración sobre números de cliente afecta a la red
+antes que a la API.
 
-Es **en memoria y por proceso**: con N workers de uvicorn el límite efectivo es N
-veces el configurado. Con un solo proceso el número es exacto.
+La implementación es **en memoria y por proceso**: con N workers de uvicorn el
+límite efectivo equivale a N veces el valor configurado. Con un único proceso el
+valor es exacto.
 
 ## Códigos de error
 
 | Código | Significado |
 |---|---|
-| `403` | API Key inválida o ausente, o válida pero sin alcance para ese endpoint |
+| `403` | API Key inválida o ausente, o válida pero sin alcance sobre el endpoint |
 | `404` | El recurso no existe o no tiene datos asociados |
 | `422` | Un parámetro no cumple el formato o el rango esperado |
 | `429` | Rate limit del consumidor alcanzado |
-| `500` | Error inesperado al procesar |
+| `500` | Error inesperado durante el procesamiento |
 | `503` | Alguna base de datos no responde — `/health` indica cuál |
 | `504` | La detección de corte superó su tope de tiempo |
 
-Todos los errores comparten el mismo cuerpo: `{"detail": "<motivo>"}`.
+Todas las respuestas de error comparten el mismo cuerpo: `{"detail": "<motivo>"}`.
 
-Un `503` distingue el caso en que **falta el dato sin el cual la respuesta sería
-inventada**. Las verificaciones individuales que fallan (un ping, un `snmpget`)
-no rompen la respuesta: quedan como "no evaluable", se loguean y no cuentan como
-falla.
+El `503` identifica el caso en que **falta el dato sin el cual la respuesta
+carecería de respaldo**. Las verificaciones individuales que fallan (un ping, un
+`snmpget`) no invalidan la respuesta: se registran como "no evaluable", quedan
+asentadas en el log y no computan como falla.
 
 ## Zona horaria y timestamps
 
-Todos los campos `*_timestamp` son **epoch UNIX en segundos** (UTC). No hay
-fechas en texto salvo dentro de los logs crudos que devuelve el sistema de
-monitoreo.
+Todos los campos `*_timestamp` son **epoch UNIX en segundos** (UTC). No se
+devuelven fechas en texto, con excepción de las contenidas en los registros
+crudos que provee el sistema de monitoreo.
 """
 
 TAGS_METADATA = [
@@ -147,28 +154,29 @@ TAGS_METADATA = [
         "description": (
             "Series históricas de **una** ONU identificada por su precinto: "
             "potencia óptica recibida por la ONU y por la OLT, log de causas de "
-            "caída y cambios de estado. Es la vista de diagnóstico fino. "
-            "**Interno**: no lo alcanzan las claves externas."
+            "caída y cambios de estado. Constituye la vista de diagnóstico "
+            "detallado. **Endpoint interno**: no accesible con claves externas."
         ),
     },
     {
         "name": "analiticas",
         "description": (
             "Estado agregado del **parque completo** de una empresa, con resumen "
-            "por categoría y listado paginado de dispositivos. Pensado para "
-            "tableros y reportes de disponibilidad. **Interno**: no lo "
-            "alcanzan las claves externas."
+            "por categoría y listado paginado de dispositivos. Orientado a "
+            "tableros y reportes de disponibilidad. **Endpoint interno**: no "
+            "accesible con claves externas."
         ),
     },
     {
         "name": "cortes",
         "description": (
-            "Diagnóstico de **un cliente** por su número de contrato: si está "
-            "navegando y si el corte afecta a la zona. Contrato de salida cerrado "
-            "de tres booleanos, pensado para consumirlo desde un CRM o un bot de "
-            "atención. Es el único que alcanzan las claves externas, y el que "
-            "amplifica contra la red: un request dispara consultas SNMP contra "
-            "una OLT de producción."
+            "Diagnóstico de **un cliente** identificado por su número de "
+            "contrato: determina si el servicio está operativo y si la falla "
+            "afecta a la zona. Contrato de salida cerrado de tres booleanos, "
+            "orientado a su consumo desde un CRM o un asistente de atención. "
+            "Es el único endpoint accesible con claves externas y el de mayor "
+            "amplificación sobre la red: un request origina consultas SNMP "
+            "contra una OLT en producción."
         ),
     },
     {
@@ -281,9 +289,10 @@ def redoc_protegido(key: str = Query(default=None)):
     responses={
         200: {
             "description": (
-                "Chequeo realizado. **Siempre 200, incluso en 'degraded'**: el "
-                "código HTTP indica que el chequeo se pudo hacer, no que todo "
-                "esté sano. Hay que mirar el campo `status`."
+                "Verificación realizada. **Siempre 200, incluso con 'degraded'**: "
+                "el código HTTP indica que la verificación pudo ejecutarse, no "
+                "que todas las dependencias estén operativas. El estado real se "
+                "determina por el campo `status`."
             ),
             "content": {
                 "application/json": {
@@ -312,31 +321,31 @@ def redoc_protegido(key: str = Query(default=None)):
     },
 )
 def health():
-    """Verifica que la API pueda hablar con todo aquello de lo que depende.
+    """Verifica la conectividad de la API con la totalidad de sus dependencias.
 
-    Hace un `ping` de conexión contra cada una de las cinco bases de datos y
-    comprueba que estén disponibles los dos binarios del sistema que usa la
+    Ejecuta un `ping` de conexión contra cada una de las cinco bases de datos y
+    comprueba la disponibilidad de los dos binarios del sistema que utiliza la
     detección de cortes.
 
-    **Parámetros:** ninguno. Solo requiere la cabecera `X-API-Key`.
+    **Parámetros:** ninguno. Requiere únicamente la cabecera `X-API-Key`.
 
     **Devuelve** un objeto con:
 
-    * `status`: `"success"` si todo responde, `"degraded"` si falla al menos una
-      base o una utilidad.
+    * `status`: `"success"` si todas las dependencias responden, `"degraded"` si
+      falla al menos una base o una utilidad.
     * `environment`: entorno declarado en la variable `ENVIRONMENT`.
     * `bases`: por cada base, un `{"ok": bool}` y, cuando falla, el `error`
       devuelto por el driver.
     * `utilidades`: idem para `ping` y `snmpget`.
 
     `ping` y `snmpget` son binarios del sistema, no dependencias de Python: si
-    faltan, el endpoint de cortes responde igual pero con todas las
-    verificaciones de red en "no evaluable". Verlo acá evita tener que deducirlo
-    a partir de resultados raros.
+    no están disponibles, el endpoint de cortes responde igualmente, pero con
+    todas las verificaciones de red en "no evaluable". Exponerlo en este endpoint
+    evita tener que inferirlo a partir de resultados anómalos.
 
-    El endpoint responde **200 en ambos casos**: un `status: "degraded"` no es un
-    error del request. Los monitores tienen que alertar sobre el campo `status`,
-    no sobre el código HTTP.
+    El endpoint responde **200 en ambos casos**: un `status: "degraded"` no
+    constituye un error del request. Los sistemas de monitoreo deben alertar
+    sobre el campo `status`, no sobre el código HTTP.
     """
     resultado = {}
     for nombre in ("zabbix", "zabbix_wireless", "soldef", "napear", "gestion"):

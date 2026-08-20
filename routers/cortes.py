@@ -40,24 +40,24 @@ def cerrar_ejecutor() -> None:
 @router.get(
     "/api/v1/cortes/{numero_cliente}",
     response_model=CorteResponse,
-    summary="Detecta si un cliente está caído y si el corte es de zona",
+    summary="Determina la interrupción de servicio de un cliente y su alcance",
     response_description=(
-        "Los tres booleanos del diagnóstico: tecnología del plan, si el cliente "
-        "navega y si el corte afecta a la zona"
+        "Los tres booleanos del diagnóstico: tecnología del plan, disponibilidad "
+        "del servicio y alcance de zona de la falla"
     ),
     responses={
         200: {
             "description": (
-                "Diagnóstico resuelto. Una verificación suelta que falle no rompe "
-                "la respuesta: queda como 'no evaluable', se loguea y no cuenta "
-                "como falla en la decisión."
+                "Diagnóstico resuelto. Una verificación individual fallida no "
+                "invalida la respuesta: se registra como 'no evaluable', queda "
+                "asentada en el log y no computa como falla en la decisión."
             )
         },
         **ERRORES_AUTENTICACION,
         404: {
             "description": (
-                "El cliente no existe, no tiene contrato activo, o su plan no cae "
-                "en las categorías contempladas (fibra o wireless)."
+                "El cliente no existe, no registra contrato activo, o su plan no "
+                "corresponde a las categorías contempladas (fibra o wireless)."
             ),
             "content": {
                 "application/json": {
@@ -70,7 +70,7 @@ def cerrar_ejecutor() -> None:
         },
         422: {
             "description": (
-                f"`numero_cliente` no es numérico o pasa los {MAX_LARGO_CLIENTE} "
+                f"`numero_cliente` no es numérico o excede los {MAX_LARGO_CLIENTE} "
                 "dígitos."
             ),
             "content": {
@@ -87,7 +87,7 @@ def cerrar_ejecutor() -> None:
         # por eso acá va un solo ejemplo y no dos como en analytics.
         **ERROR_RATE_LIMIT,
         500: {
-            "description": "Error inesperado al procesar la detección.",
+            "description": "Error inesperado durante la resolución del diagnóstico.",
             "content": {
                 "application/json": {
                     "example": {"detail": "Error al procesar la detección de corte"}
@@ -96,9 +96,10 @@ def cerrar_ejecutor() -> None:
         },
         503: {
             "description": (
-                "Gestión, o el Zabbix de la tecnología del cliente, no responde. "
-                "Sin ese dato la respuesta sería inventada, así que se rechaza el "
-                "request en vez de devolver booleanos sin respaldo."
+                "La base de administración, o el sistema de monitoreo correspondiente "
+                "a la tecnología del cliente, no responde. Sin ese dato la "
+                "respuesta carecería de respaldo, por lo que se rechaza el "
+                "request en lugar de devolver booleanos no verificados."
             ),
             "content": {
                 "application/json": {
@@ -109,8 +110,9 @@ def cerrar_ejecutor() -> None:
         504: {
             "description": (
                 f"La detección superó los {config.CORTES_TIMEOUT_SEG}s "
-                "(`CORTES_TIMEOUT_SEG`). Suele indicar una OLT o una base lentas, "
-                "o que hay más requests en cola que el tope de concurrencia."
+                "(`CORTES_TIMEOUT_SEG`). Habitualmente indica latencia elevada "
+                "en una OLT o en una base de datos, o una cola de requests "
+                "superior al tope de concurrencia."
             ),
             "content": {
                 "application/json": {
@@ -128,67 +130,68 @@ async def detectar_corte(
         ...,
         description=(
             f"Número de cliente: solo dígitos, hasta {MAX_LARGO_CLIENTE} "
-            "caracteres (campo `customer.code` de Gestión)"
+            "caracteres. Corresponde al código de cliente del sistema de "
+            "administración."
         ),
     ),
     consumidor: str = Depends(limitar_tasa),
 ):
-    """Diagnostica en vivo si un cliente está sin servicio y si el corte es de zona.
+    """Diagnostica en tiempo real la interrupción de servicio de un cliente.
 
-    Pensado para atención al cliente: responde las dos preguntas que definen cómo
-    seguir una consulta —¿el cliente está caído?, ¿es un problema suyo o de la
-    zona?— en una sola llamada y con un contrato de salida cerrado de tres
-    booleanos.
+    Orientado a atención al cliente: resuelve en una sola llamada las dos
+    preguntas que determinan el curso de la consulta —si el cliente tiene
+    servicio y si la falla es individual o de zona— con un contrato de salida
+    cerrado de tres booleanos.
 
-    Parte del número de cliente en **Gestión**, de donde saca la tecnología del
-    plan y la IP, y a partir de ahí bifurca:
+    Parte del número de cliente en la **base de administración**, de la que
+    obtiene la tecnología del plan y la IP asignada, y a partir de ahí bifurca:
 
-    * **Fibra (FTTH)** — consulta el Zabbix de fibra por la NAP, la OLT y su IP;
-      verifica el estado de la ONT y el de la NAP (por consulta, o por `snmpget`
-      directo contra la OLT si es una OLT "Solar"), y consulta Soldef por el
-      switch del nodo.
-    * **Wireless** — consulta el Zabbix de wireless por el Access Point y el
-      RouterBoard del nodo.
+    * **Fibra (FTTH)** — consulta el sistema de monitoreo de fibra por la NAP, la
+      OLT y su IP; verifica el estado de la ONT y el de la NAP (por consulta, o
+      por `snmpget` directo contra la OLT en el caso de las OLT "Solar"), y
+      consulta el inventario de red por el switch del nodo.
+    * **Wireless** — consulta el sistema de monitoreo de wireless por el Access
+      Point y el RouterBoard del nodo.
 
     Las verificaciones del último paso (pings, `snmpget` y consultas de estado)
-    son independientes entre sí y corren en paralelo.
+    son independientes entre sí y se ejecutan en paralelo.
 
     **Parámetros**
 
-    * `numero_cliente` (ruta): solo dígitos, hasta 12 caracteres. Es el
-      campo `customer.code` de Gestión. La restricción no es cosmética: el valor
-      entra a una consulta MySQL, a una PostgreSQL y a los logs, y limitarlo a
-      dígitos lo vuelve inofensivo en los tres.
+    * `numero_cliente` (ruta): solo dígitos, hasta 12 caracteres. Corresponde al
+      código de cliente del sistema de administración. La restricción no es
+      cosmética: el valor se incorpora a una consulta MySQL, a una PostgreSQL y a
+      los logs, y limitarlo a dígitos lo vuelve inocuo en los tres contextos.
 
     **Devuelve** exactamente tres campos, sin envoltorio ni metadata:
 
-    * `isFtth` — el plan activo es de fibra (`category_id` 16). `false` =
-      wireless (17).
-    * `isOnline` — el cliente está navegando. En fibra es `false` **solo si** no
-      responde al ping *y* la ONT reporta LOS/Offline; en wireless, es el ping al
-      cliente.
-    * `isZoneIncident` — el corte afecta a más gente. En fibra: la NAP está en
-      corte o la OLT no responde. En wireless: el AP o el RouterBoard del nodo no
-      responden.
+    * `isFtth` — el plan activo es de fibra (`category_id` 16). `false`
+      corresponde a wireless (17).
+    * `isOnline` — el cliente tiene servicio. En fibra es `false` **únicamente
+      si** no responde al ping *y* la ONT reporta LOS/Offline; en wireless se
+      determina por el ping al cliente.
+    * `isZoneIncident` — la falla afecta a más de un cliente. En fibra: la NAP
+      está en corte, o la OLT no responde. En wireless: el AP o el RouterBoard
+      del nodo no responden.
 
-    La combinación de los dos últimos es lo que se usa operativamente:
+    La combinación de los dos últimos campos define la interpretación operativa:
 
-    | `isOnline` | `isZoneIncident` | Lectura |
+    | `isOnline` | `isZoneIncident` | Interpretación |
     |---|---|---|
-    | `false` | `true` | Corte de zona: hay otros afectados, ya hay incidente o cuadrilla |
-    | `false` | `false` | Falla individual: ONT, corte de energía en el domicilio, cable |
-    | `true` | `true` | El cliente navega pero hay un incidente cerca; puede estar degradado |
-    | `true` | `false` | Todo normal desde la red |
+    | `false` | `true` | Corte de zona: existen otros afectados; hay incidente registrado o cuadrilla asignada |
+    | `false` | `false` | Falla individual: ONT, corte de energía en el domicilio o cableado |
+    | `true` | `true` | El cliente tiene servicio, pero hay un incidente próximo; puede presentar degradación |
+    | `true` | `false` | Sin anomalías detectables desde la red |
 
-    El detalle de cada verificación individual queda en el **log del servidor**,
-    no en la respuesta. Una verificación que falla no rompe el diagnóstico: queda
-    como "no evaluable" y no cuenta como falla.
+    El detalle de cada verificación individual se registra en el **log del
+    servidor**, no en la respuesta. Una verificación fallida no invalida el
+    diagnóstico: se registra como "no evaluable" y no computa como falla.
 
-    Este endpoint tiene **rate limit por consumidor** (`429` con `Retry-After`) y
-    un tope de concurrencia: por encima de él los requests encolan y, si no
-    llegan a tiempo, salen por `504`. El motivo es la red, no la API: un solo
-    request puede disparar decenas de consultas SNMP contra una OLT de
-    producción.
+    Este endpoint aplica **rate limit por consumidor** (`429` con `Retry-After`)
+    y un tope de concurrencia: superado ese tope los requests se encolan y, de no
+    resolverse a tiempo, responden `504`. El motivo es la protección de la red,
+    no de la API: un único request puede originar decenas de consultas SNMP
+    contra una OLT en producción.
     """
     numero_cliente = numero_cliente.strip()
     if not _SOLO_DIGITOS.match(numero_cliente):
