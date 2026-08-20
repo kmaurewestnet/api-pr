@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, Query
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
 from fastapi.responses import JSONResponse
 
@@ -206,6 +207,22 @@ app = FastAPI(
     redoc_url=None,
     openapi_url=None,
 )
+
+# CORS solo si hay un panel web declarado. Sin CORS_ORIGINS no se monta nada:
+# los consumidores server-to-server no pasan por el navegador y el middleware
+# seria peso muerto.
+#
+# allow_credentials queda en False a proposito: la autenticacion es la cabecera
+# X-API-Key, no una cookie, y ponerlo en True obligaria a jurar que el origen es
+# exacto sin ganar nada. GET es el unico metodo que expone la API.
+if config.CORS_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=list(config.CORS_ORIGINS),
+        allow_methods=["GET"],
+        allow_headers=[config.API_KEY_NAME],
+        max_age=3600,
+    )
 
 app.include_router(precinto.router)
 app.include_router(analytics.router)

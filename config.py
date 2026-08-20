@@ -95,6 +95,14 @@ RATE_LIMIT_INTERNO_BURST = _int(
 # entrar en loop. El costo real de ese loop no lo paga la API sino la OLT.
 RATE_LIMIT_POR_CONSUMIDOR_CRUDO = os.getenv("RATE_LIMIT_POR_CONSUMIDOR", "")
 
+# Origenes que pueden llamar a la API desde un navegador (CORS). Lista de URLs
+# completas separadas por coma: `https://panel.westnet.com.ar`. Vacio —el
+# default— deja CORS apagado, que es lo correcto mientras los consumidores sean
+# server-to-server: la centralita, el chatbot y curl no miran estas cabeceras.
+CORS_ORIGINS = tuple(
+    o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()
+)
+
 # Tope de filas por serie del endpoint de precinto. Una ONU sola en la ventana
 # maxima (168 h, lecturas por minuto) da ~10.000 puntos, asi que el tope no toca
 # el caso legitimo: acota lo que puede arrastrar una busqueda parcial corta que
