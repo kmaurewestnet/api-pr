@@ -31,15 +31,15 @@ async def lifespan(app: FastAPI):
 DESCRIPCION = """
 API de monitoreo de red de acceso: consulta el estado de las ONUs de fibra
 (GPON) y de los enlaces wireless cruzando **cinco bases de datos** que no
-admiten JOIN entre sí (Zabbix Fibra, Zabbix Wireless, Soldef, Napear y Gestión),
-más verificaciones en vivo por `ping` ICMP y `snmpget` contra las OLT.
+admiten JOIN entre sí, más verificaciones en vivo por `ping` ICMP y `snmpget`
+contra las OLT.
 
-## Qué resuelve cada endpoint
+## Endpoints
 
 | Endpoint | Alcance | Caso de uso típico |
 |---|---|---|
 | `GET /api/v1/precinto/{codigo}` | Una ONU | Diagnóstico fino: series históricas de potencia óptica, logs y estados |
-| `GET /api/v1/empresa/{id}/analytics` | El parque completo de una empresa | Tableros, reportes de disponibilidad, auditoría de cobertura |
+| `GET /api/v1/empresa/{id}/analytics` | Parque completo de una empresa | Tableros, reportes de disponibilidad, auditoría de cobertura |
 | `GET /api/v1/cortes/{numero_cliente}` | Un cliente | Atención al cliente: ¿está caído? ¿es un corte de zona? |
 | `GET /health` | La API misma | Monitoreo del servicio y de sus dependencias |
 
@@ -52,34 +52,29 @@ curl -H "X-API-Key: $API_KEY" "http://localhost:8000/api/v1/cortes/302381"
 ```
 
 Cada consumidor tiene su propia clave. El nombre asociado aparece en cada línea
-de log y es la unidad del **rate limit**, así que se le puede revocar o limitar a
-uno sin afectar a los demás. Una clave inválida o ausente devuelve `403`.
+de log y es la unidad del **rate limit**, permitiendo revocar o limitar
+individualmente sin afectar a los demás. Una clave inválida o ausente devuelve
+`403`.
 
-La documentación misma está protegida: `/docs`, `/redoc` y `/openapi.json`
-exigen la clave igual que los endpoints, pero **solo ellas la aceptan también
-por `?key=`**, porque el navegador no puede mandar cabeceras al abrir una URL:
-
-```bash
-# Para bajar el esquema y generar un cliente
-curl -H "X-API-Key: $API_KEY" "http://localhost:8000/openapi.json"
-```
+La documentación está protegida: `/docs`, `/redoc` y `/openapi.json` exigen la
+clave igual que los endpoints, pero **solo ellas la aceptan también por
+`?key=`**, porque el navegador no puede enviar cabeceras al abrir una URL.
 
 Para abrir esta página en el navegador: `http://localhost:8000/docs?key=<clave>`.
 Tené en cuenta que así la clave queda en el historial y en el log de accesos.
 
-## Modelo de confianza
+## Modelo de acceso
 
 **No hay filtro por empresa, y es a propósito.** `/precinto` y `/analytics`
 cruzan el parque de las 17 empresas porque esa es su función: son la vista del
-NOC sobre toda la red de acceso, no un portal por cliente. No existe ni está
-previsto un vínculo clave → empresa; si aparece un consumidor que sólo deba ver
-lo suyo, ese recorte va del lado de quien consume, no acá.
+equipo de operaciones sobre toda la red de acceso, no un portal por cliente. No
+existe vínculo clave → empresa; si aparece un consumidor que sólo deba ver lo
+suyo, ese recorte va del lado de quien consume, no acá.
 
-Lo que sí se acota es **hasta dónde llega cada clave**. Las internas llegan a
-todo. Las externas —hoy la centralita y el chatbot— se limitan a `/cortes` con
-`API_KEYS_SOLO_CORTES`, porque `/cortes` responde por un cliente puntual y no
-expone el parque de nadie. Con una clave así, cualquier otro endpoint devuelve
-`403`.
+Lo que sí se acota es **hasta dónde llega cada clave**. Las claves internas
+acceden a todo. Las externas se limitan a `/cortes` con `API_KEYS_SOLO_CORTES`,
+porque `/cortes` responde por un cliente puntual y no expone el parque de nadie.
+Con una clave externa, cualquier otro endpoint devuelve `403`.
 
 | Endpoint | Claves que lo alcanzan | Qué expone |
 |---|---|---|
@@ -89,8 +84,7 @@ expone el parque de nadie. Con una clave así, cualquier otro endpoint devuelve
 | `GET /health` | internas y externas | estado del servicio |
 
 El precinto se compara como **texto literal**: los metacaracteres no significan
-nada. Antes se compilaba como expresión regular y quien llamaba elegía el patrón,
-no el valor.
+nada.
 
 ## Rate limit
 
@@ -101,14 +95,16 @@ Cubeta de tokens **por consumidor**, con dos cuotas separadas:
 | `/cortes` | `RATE_LIMIT_POR_MINUTO` | 60 por minuto |
 | `/precinto` y `/analytics` | `RATE_LIMIT_INTERNO_POR_MINUTO` | 10 por minuto |
 
-Van separadas porque no cuestan lo mismo: una analítica recorre el parque entero
-de la empresa **aunque se pida `limit=1`**, y comparte con `/cortes` el pool de
-conexiones a Zabbix. Que un tablero refrescando no pueda dejar sin atender a la
-centralita es el motivo de que la cuota interna sea la más baja.
+Van separadas porque no cuestan lo mismo: una analítica recorre el parque
+entero de la empresa **aunque se pida `limit=1`**, y comparte con `/cortes` el
+pool de conexiones al sistema de monitoreo. Que un tablero refrescando no pueda
+dejar sin atender a otros consumidores es el motivo de que la cuota interna sea
+la más baja.
 
 `RATE_LIMIT_POR_CONSUMIDOR` le da una cuota distinta a un consumidor puntual
-(`chatbot:20,centralita:120`). Ajusta la cuota de `/cortes`; los endpoints
-internos no se ajustan por consumidor, porque ahí sólo llegan claves internas.
+(`consumidor_a:20,consumidor_b:120`). Ajusta la cuota de `/cortes`; los
+endpoints internos no se ajustan por consumidor, porque ahí sólo llegan claves
+internas.
 
 Al agotarse, `429` con la cabecera `Retry-After` en segundos.
 
@@ -117,10 +113,9 @@ disparar decenas de consultas SNMP contra una OLT de producción**, así que un
 loop sobre números de cliente le hace DoS a la red, no a la API.
 
 Es **en memoria y por proceso**: con N workers de uvicorn el límite efectivo es N
-veces el configurado. Con un solo proceso —como lo levanta el README— el número
-es exacto.
+veces el configurado. Con un solo proceso el número es exacto.
 
-## Cómo leer los errores
+## Códigos de error
 
 | Código | Significado |
 |---|---|
@@ -142,7 +137,8 @@ falla.
 ## Zona horaria y timestamps
 
 Todos los campos `*_timestamp` son **epoch UNIX en segundos** (UTC). No hay
-fechas en texto salvo dentro de los logs crudos que devuelve Zabbix.
+fechas en texto salvo dentro de los logs crudos que devuelve el sistema de
+monitoreo.
 """
 
 TAGS_METADATA = [
@@ -185,7 +181,7 @@ TAGS_METADATA = [
 ]
 
 app = FastAPI(
-    title="Zabbix Precintos API",
+    title="API de Monitoreo de Red de Acceso",
     description=DESCRIPCION,
     summary=(
         "Estado de ONUs de fibra y enlaces wireless: métricas por precinto, "
@@ -193,8 +189,7 @@ app = FastAPI(
     ),
     version="2.1.0",
     contact={
-        "name": "Equipo de Redes / NOC",
-        "email": "noc@westnet.com.ar",
+        "name": "Equipo de Operaciones de Red",
     },
     openapi_tags=TAGS_METADATA,
     lifespan=lifespan,
@@ -330,9 +325,8 @@ def health():
     * `status`: `"success"` si todo responde, `"degraded"` si falla al menos una
       base o una utilidad.
     * `environment`: entorno declarado en la variable `ENVIRONMENT`.
-    * `bases`: por cada base (`zabbix`, `zabbix_wireless`, `soldef`, `napear`,
-      `gestion`), un `{"ok": bool}` y, cuando falla, el `error` devuelto por el
-      driver.
+    * `bases`: por cada base, un `{"ok": bool}` y, cuando falla, el `error`
+      devuelto por el driver.
     * `utilidades`: idem para `ping` y `snmpget`.
 
     `ping` y `snmpget` son binarios del sistema, no dependencias de Python: si
