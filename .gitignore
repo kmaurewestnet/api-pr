@@ -5,3 +5,4 @@ venv/
 .venv/
 *.log
 Pentest/
+CONTEXT.md
