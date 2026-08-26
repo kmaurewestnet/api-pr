@@ -13,9 +13,11 @@ import time
 import threading
 
 import config
+import db
 
 from queries import cortes as q
 from services import cortes as svc
+from services import cortes_io as io
 from services import red
 from services.cache import CacheTTL
 
@@ -104,21 +106,22 @@ def test_ont_solar_combina_los_y_onlinestate():
     """El documento actualizado agrega la consulta de OIDs de OnlineState: una
     sola señal en alarma alcanza para dar la ONT por caida."""
     lecturas = {}
-    original = svc._interpretar
-    svc._valores_snmp = lambda ip, oids: {}
-    svc._interpretar = lambda oids, val, interprete, metrica, ip: lecturas.get(metrica, [])
+    fuente = io.FuenteReal()
+    orig_valores, orig_interpretar = io._valores_snmp, io._interpretar
+    io._valores_snmp = lambda ip, oids: {}
+    io._interpretar = lambda oids, val, interprete, metrica, ip: lecturas.get(metrica, [])
     try:
         lecturas = {"LOS": [False], "OnlineState": [False]}
-        assert svc._ont_por_snmp("10.0.0.1", ["1.1"], ["1.2"]) is False
+        assert fuente.ont_por_snmp("10.0.0.1", ["1.1"], ["1.2"]) is False
         lecturas = {"LOS": [False], "OnlineState": [True]}
-        assert svc._ont_por_snmp("10.0.0.1", ["1.1"], ["1.2"]) is True
+        assert fuente.ont_por_snmp("10.0.0.1", ["1.1"], ["1.2"]) is True
         lecturas = {"LOS": [True], "OnlineState": []}
-        assert svc._ont_por_snmp("10.0.0.1", ["1.1"], []) is True
+        assert fuente.ont_por_snmp("10.0.0.1", ["1.1"], []) is True
         # Ninguna de las dos se pudo interpretar: no evaluable, no "caida".
         lecturas = {}
-        assert svc._ont_por_snmp("10.0.0.1", ["1.1"], ["1.2"]) is None
+        assert fuente.ont_por_snmp("10.0.0.1", ["1.1"], ["1.2"]) is None
     finally:
-        svc._interpretar = original
+        io._valores_snmp, io._interpretar = orig_valores, orig_interpretar
 
 
 def test_esta_offline():
@@ -584,6 +587,228 @@ def test_rate_limit_por_consumidor():
 
     # En 0 se desactiva.
     assert all(CubetaDeTokens(0, 1).consumir("x")[0] for _ in range(50))
+
+
+# --- El cableado de las dos tandas -------------------------------------------
+#
+# Las reglas puras de arriba se prueban con argumentos posicionales, asi que un
+# error en el armado de `tareas`/`tareas2` —una clave renombrada, una señal que
+# nunca se pide— las deja pasar igual. Estas pruebas manejan `_evaluar_ftth` y
+# `_evaluar_wireless` enteros contra una fuente en memoria: lo que se verifica es
+# el camino de cada señal desde la fuente hasta su lugar en la matriz.
+
+TOPO_FTTH = {"nap": "GLL-2763", "olt_nombre": "OLT-CENTRO", "olt_ip": "10.20.0.5"}
+TOPO_SOLAR = {"nap": "GLL-90", "olt_nombre": "OLT-SOLAR-3", "olt_ip": "10.20.0.9"}
+TOPO_SIN_ONT = {"nap": None, "olt_nombre": None, "olt_ip": ""}
+CLIENTE_FTTH = {"ip": "192.168.5.20", "is_ftth": True,
+                "nro_cliente": "302381", "categoria": "FTTH", "categoria_id": 16}
+CLIENTE_WIFI = {"ip": "10.55.3.44", "is_ftth": False,
+                "nro_cliente": "5001", "categoria": "Wireless", "categoria_id": 17}
+
+
+class FuenteFalsa:
+    """Fuente en memoria. Devuelve la señal pedida y anota que se la pidieron.
+
+    Un valor que sea una excepcion se levanta en vez de devolverse: con eso se
+    prueban tanto la degradacion a "no evaluable" como el corte por PoolAgotado.
+    Una señal que no se declara vale None, que es justo el caso peligroso.
+    """
+
+    def __init__(self, **señales):
+        self.señales = señales
+        self.pedidos = []
+
+    def _dar(self, nombre):
+        self.pedidos.append(nombre)
+        valor = self.señales.get(nombre)
+        if isinstance(valor, Exception):
+            raise valor
+        return valor
+
+    def ping_cliente(self, ip):
+        return self._dar("ping_cliente")
+
+    def ping_zona(self, ip, rol):
+        return self._dar(f"ping_{rol}")
+
+    def topologia_ftth(self, nro_cliente):
+        return self._dar("topologia_ftth")
+
+    def topologia_wireless(self, ip):
+        return self._dar("topologia_wireless")
+
+    def switch_del_nodo(self, olt_ip):
+        return self._dar("switch")
+
+    def estado_nap(self, olt_ip, nap, es_solar):
+        return self._dar("nap")
+
+    def estado_ont(self, nro_cliente):
+        return self._dar("ont")
+
+    def oids_solar(self, nro_cliente):
+        return self._dar("oids")
+
+    def ont_por_snmp(self, olt_ip, oids_los, oids_online):
+        return self._dar("ont_snmp")
+
+
+def _ftth(**señales):
+    señales.setdefault("topologia_ftth", TOPO_FTTH)
+    fuente = FuenteFalsa(**señales)
+    return svc._evaluar_ftth("302381", CLIENTE_FTTH, fuente), fuente
+
+
+def test_evaluar_ftth_recorre_la_matriz_completa():
+    """Misma matriz que test_matriz_*, pero entrando por donde entra el request:
+    si una clave de `tareas` deja de coincidir con la que lee `decidir_ftth`,
+    esto rompe y aquellas no."""
+    base = dict(ping_cliente=RESPONDE, ont=False, nap=False, ping_olt=RESPONDE,
+                switch={"nombre": "sw", "ip": "10.20.0.2"}, ping_switch=RESPONDE)
+
+    r, _ = _ftth(**base)
+    assert r == {"isFtth": True, "isOnline": True, "isZoneIncident": False}
+
+    # Ping caido pero la ONT no reporta alarma: sigue online.
+    r, _ = _ftth(**{**base, "ping_cliente": FALLA, "ont": SIN_DATO})
+    assert r["isOnline"] is False
+    r, _ = _ftth(**{**base, "ping_cliente": FALLA, "ont": False})
+    assert r["isOnline"] is True
+
+    # Zona: la NAP caida o la OLT sin responder, cada una por su lado.
+    r, _ = _ftth(**{**base, "nap": True})
+    assert r["isZoneIncident"] is True
+    r, _ = _ftth(**{**base, "ping_olt": FALLA})
+    assert r["isZoneIncident"] is True
+    # El ping al switch se ejecuta pero no cambia el resultado.
+    r, fuente = _ftth(**{**base, "ping_switch": FALLA})
+    assert r["isZoneIncident"] is False
+    assert "ping_switch" in fuente.pedidos
+
+
+def test_evaluar_ftth_solar_toma_la_ont_de_la_segunda_tanda():
+    """En Solar la ONT no sale de una consulta sino del snmpget de la segunda
+    tanda: son dos caminos distintos hasta la misma clave."""
+    r, fuente = _ftth(topologia_ftth=TOPO_SOLAR, ping_cliente=FALLA,
+                      oids={"oids_los": ["1.1"], "oids_online": ["1.2"]},
+                      ont_snmp=False, nap=False, ping_olt=RESPONDE)
+    assert r["isOnline"] is True          # la ONT vino por SNMP y no reporta alarma
+    assert "oids" in fuente.pedidos       # se pidieron los OIDs de este cliente...
+    assert "ont_snmp" in fuente.pedidos   # ...y se preguntó a la OLT
+    assert "ont" not in fuente.pedidos    # y NO se usó el camino por consulta
+
+    # Y el no-Solar es el espejo exacto.
+    _, fuente = _ftth(ont=False, nap=False, ping_olt=RESPONDE)
+    assert "ont" in fuente.pedidos
+    assert "oids" not in fuente.pedidos and "ont_snmp" not in fuente.pedidos
+
+
+def test_pool_agotado_corta_el_request_entero():
+    """Quedarse sin conexiones no es "la red no contestó": tiene que salir por
+    503 y no calcularse una respuesta sobre datos que nunca se consultaron."""
+    try:
+        _ftth(ping_cliente=RESPONDE, nap=db.PoolAgotado("sin conexiones"))
+        assert False, "PoolAgotado tenia que propagarse"
+    except db.PoolAgotado:
+        pass
+
+    # Y sigue saliendo cuando se entra por detectar(), que es el camino real.
+    original = svc.buscar_cliente
+    svc.buscar_cliente = lambda nro: CLIENTE_FTTH
+    try:
+        fuente = FuenteFalsa(topologia_ftth=TOPO_FTTH,
+                             ping_olt=db.PoolAgotado("sin conexiones"))
+        try:
+            svc.detectar("302381", fuente)
+            assert False, "PoolAgotado tenia que propagarse desde detectar()"
+        except db.PoolAgotado:
+            pass
+    finally:
+        svc.buscar_cliente = original
+
+
+def test_una_verificacion_que_falla_queda_no_evaluable():
+    """Cualquier otra excepcion degrada esa señal a None y no arrastra al resto:
+    None no es False, asi que no cuenta como caida en la matriz."""
+    r, _ = _ftth(ping_cliente=RESPONDE, ont=RuntimeError("zabbix lento"),
+                 nap=RuntimeError("timeout"), ping_olt=RESPONDE)
+    assert r == {"isFtth": True, "isOnline": True, "isZoneIncident": False}
+
+    # Soldef caida: se pierde el ping al switch y nada mas.
+    r, _ = _ftth(ping_cliente=RESPONDE, ont=False, nap=False, ping_olt=RESPONDE,
+                 switch=RuntimeError("soldef no responde"))
+    assert r["isZoneIncident"] is False
+
+
+def test_topologia_caida_no_degrada_a_doscientos():
+    """Sin topologia, isZoneIncident seria inventado: es 503, no 200."""
+    for error in (db.DatabaseUnavailable("zabbix"), RuntimeError("lo que sea")):
+        try:
+            _ftth(topologia_ftth=error)
+            assert False, f"{type(error).__name__} tenia que propagarse"
+        except db.DatabaseUnavailable:
+            pass
+
+
+def test_evaluar_wireless_recorre_su_matriz():
+    def wifi(**señales):
+        señales.setdefault("topologia_wireless",
+                           {"ap": "AP-1", "ap_ip": "10.55.0.1",
+                            "rb": "RB-1", "rb_ip": "10.55.0.254"})
+        fuente = FuenteFalsa(**señales)
+        return svc._evaluar_wireless("5001", CLIENTE_WIFI, fuente), fuente
+
+    r, _ = wifi(ping_cliente=RESPONDE, ping_ap=RESPONDE, ping_routerboard=RESPONDE)
+    assert r == {"isFtth": False, "isOnline": True, "isZoneIncident": False}
+    # En wireless isOnline es solo el ping al cliente.
+    r, _ = wifi(ping_cliente=FALLA, ping_ap=RESPONDE, ping_routerboard=RESPONDE)
+    assert r["isOnline"] is False
+    # Zona: la infraestructura compartida del nodo, cualquiera de las dos.
+    r, _ = wifi(ping_cliente=RESPONDE, ping_ap=FALLA, ping_routerboard=RESPONDE)
+    assert r["isZoneIncident"] is True
+    r, _ = wifi(ping_cliente=RESPONDE, ping_ap=RESPONDE, ping_routerboard=FALLA)
+    assert r["isZoneIncident"] is True
+    # Sin dato no es lo mismo que sin responder.
+    r, _ = wifi(ping_cliente=RESPONDE)
+    assert r["isZoneIncident"] is False
+
+
+def test_cliente_sin_ont_en_zabbix_se_evalua_por_ping():
+    """Degradacion documentada: sin NAP ni OLT la respuesta sale igual, con las
+    señales de zona en no evaluable."""
+    r, fuente = _ftth(topologia_ftth=TOPO_SIN_ONT, ping_cliente=FALLA, ont=True)
+    assert r == {"isFtth": True, "isOnline": False, "isZoneIncident": False}
+    # Se piden igual, y la fuente decide que no hay nada que consultar.
+    assert "nap" in fuente.pedidos and "ping_olt" in fuente.pedidos
+
+
+def test_solo_las_senales_de_zona_se_cachean():
+    """El caché es lo que evita que 50 clientes de la misma caja disparen 50
+    veces el mismo walk SNMP durante un corte. Pero cachear una señal por cliente
+    sería servirle a uno la respuesta de otro: la diferencia está en la interfaz
+    de la fuente, y esta prueba la fija."""
+    cache = CacheTTL(60, 10, nombre="prueba")
+    fuente = io.FuenteReal(cache=cache)
+    pedidos = []
+    original = io.red.ping
+    io.red.ping = lambda ip, etiqueta="": pedidos.append(etiqueta) or True
+    try:
+        # Infraestructura de la caja: se pregunta una vez y se reparte.
+        assert fuente.ping_zona("10.20.0.5", "olt") is True
+        assert fuente.ping_zona("10.20.0.5", "olt") is True
+        assert pedidos.count("olt") == 1
+        # Otra IP es otra clave: no se reusa la respuesta de la primera.
+        assert fuente.ping_zona("10.20.0.2", "switch") is True
+        assert pedidos.count("switch") == 1
+        # La respuesta puntual del cliente se pregunta siempre.
+        assert fuente.ping_cliente("192.168.5.20") is True
+        assert fuente.ping_cliente("192.168.5.20") is True
+        assert pedidos.count("cliente") == 2
+    finally:
+        io.red.ping = original
+
+    # Y el caché de produccion quedo intacto: la prueba uso el suyo.
+    assert io._zona._valores == {}
 
 
 if __name__ == "__main__":
