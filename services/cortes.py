@@ -42,7 +42,7 @@ from queries import cortes as q
 from services import red
 from services.cortes_io import FuenteReal, _en_paralelo, _regex_ip  # noqa: F401
 from services.cortes_reglas import (  # noqa: F401
-    _codigo_snmp,
+    TABLA_SNMP,
     decidir_ftth,
     decidir_wireless,
     es_ftth,

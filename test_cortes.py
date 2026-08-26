@@ -78,28 +78,47 @@ def test_codigo_snmp_desconocido_no_es_alarma():
     """La regresión que reporto produccion: con `int(valor) != 0`, un enum donde
     el codigo normal es 1 o 2 daba alarma para toda ONT sana, y de ahi la NAP
     entera se reportaba caida."""
-    los, sin_los = config.SNMP_COD_LOS, config.SNMP_COD_SIN_LOS
-    off, on = config.SNMP_COD_OFFLINE, config.SNMP_COD_ONLINE
-    try:
-        # Sin traduccion configurada: no se afirma nada.
-        config.SNMP_COD_LOS = config.SNMP_COD_SIN_LOS = frozenset()
-        assert svc.hay_los("1") is None
-        assert svc.hay_los("2") is None
-        assert svc.hay_los("0") is None
+    from services.cortes_reglas import TablaSnmp
 
-        # Con la traduccion cargada, cada codigo cae donde corresponde.
-        config.SNMP_COD_LOS, config.SNMP_COD_SIN_LOS = frozenset({2}), frozenset({1})
-        assert svc.hay_los("2") is True
-        assert svc.hay_los("1") is False
-        assert svc.hay_los("7") is None      # codigo fuera de las dos listas
+    # Sin traduccion configurada: no se afirma nada.
+    vacia = TablaSnmp(los=(), sin_los=(), offline=(), online=())
+    assert vacia.hay_los("1") is None
+    assert vacia.hay_los("2") is None
+    assert vacia.hay_los("0") is None
 
-        config.SNMP_COD_OFFLINE, config.SNMP_COD_ONLINE = frozenset({2}), frozenset({1})
-        assert svc.esta_offline("2") is True
-        assert svc.esta_offline("1") is False
-        assert svc.esta_offline("9") is None
-    finally:
-        config.SNMP_COD_LOS, config.SNMP_COD_SIN_LOS = los, sin_los
-        config.SNMP_COD_OFFLINE, config.SNMP_COD_ONLINE = off, on
+    # Con la traduccion cargada, cada codigo cae donde corresponde.
+    parque = TablaSnmp(los={2}, sin_los={1}, offline={2}, online={1})
+    assert parque.hay_los("2") is True
+    assert parque.hay_los("1") is False
+    assert parque.hay_los("7") is None      # codigo fuera de las dos listas
+    assert parque.esta_offline("2") is True
+    assert parque.esta_offline("1") is False
+    assert parque.esta_offline("9") is None
+
+
+def test_una_olt_de_otro_vendor_se_lee_con_su_tabla():
+    """Para esto existen los cuatro SNMP_COD_*: una OLT donde 1 es la alarma y 2
+    la lectura normal. El mismo valor tiene que dar lo contrario segun la tabla,
+    y el texto ya mapeado por Zabbix no depende de ninguna de las dos."""
+    from services.cortes_reglas import TablaSnmp
+
+    parque = TablaSnmp(los={2}, sin_los={1}, offline={2}, online={1})
+    invertida = TablaSnmp(los={1}, sin_los={2}, offline={1}, online={2})
+
+    assert parque.hay_los("1") is False and invertida.hay_los("1") is True
+    assert parque.hay_los("2") is True and invertida.hay_los("2") is False
+    assert parque.esta_offline("1") is False and invertida.esta_offline("1") is True
+
+    # Y la ONT combinada las sigue: una sola señal en alarma alcanza.
+    assert parque.ont_caida("1", "1") is False
+    assert invertida.ont_caida("1", "1") is True
+    assert invertida.ont_caida("2", "1") is True    # solo OnlineState en alarma
+
+    # El texto que ya mapeo Zabbix se lee igual con cualquier tabla.
+    for tabla in (parque, invertida):
+        assert tabla.hay_los("LOS") is True
+        assert tabla.hay_los("No Alarm") is False
+        assert tabla.esta_offline("Offline") is True
 
 
 def test_ont_solar_combina_los_y_onlinestate():

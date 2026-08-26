@@ -30,74 +30,108 @@ def es_ftth(categoria_id) -> bool:
         return False
 
 
-def _codigo_snmp(texto, codigos_si, codigos_no, metrica) -> bool | None:
-    """Traduce el entero crudo de un snmpget a booleano.
+class TablaSnmp:
+    """Traduce lo que reporta una OLT a las dos señales de la matriz.
 
-    Un código que no esté en ninguna de las dos listas queda en None y se
-    loguea con su valor. La regla anterior era `int(valor) != 0`, que daba
-    alarma para *cualquier* código no nulo: si la OLT contesta con un enum
-    (1 = normal, 2 = alarma, o al revés), toda ONT sana se reportaba caída y
-    de ahí la NAP entera. Un código desconocido tiene que degradar, no afirmar.
+    Acepta las dos formas en que llega el mismo dato: el texto ya mapeado que
+    guarda Zabbix en su historial ('LOS', 'No Alarm', 'Offline') y el entero
+    crudo del MIB que devuelve un snmpget directo a la OLT. Los enteros dependen
+    del vendor, y por eso son configurables.
+
+    Es un objeto y no cuatro constantes leídas desde adentro de las funciones
+    porque las reglas son puras: una OLT de otro vendor se prueba construyendo su
+    tabla, sin tocar estado global.
     """
-    codigo = int(texto)
-    if codigo in codigos_si:
-        return True
-    if codigo in codigos_no:
-        return False
-    log.warning(
-        "Código SNMP %s sin traducir para %s: agregalo a SNMP_COD_* en el .env",
-        codigo, metrica,
-    )
-    return None
 
+    def __init__(self, los, sin_los, offline, online):
+        self._los = frozenset(los)
+        self._sin_los = frozenset(sin_los)
+        self._offline = frozenset(offline)
+        self._online = frozenset(online)
 
-def hay_los(valor) -> bool | None:
-    """Alarma óptica activa.
+    def _codigo(self, texto, codigos_si, codigos_no, metrica) -> bool | None:
+        """Traduce el entero crudo de un snmpget a booleano.
 
-    Acepta el texto ya mapeado que guarda Zabbix en su historial ('LOS',
-    'No Alarm') y el entero crudo que devuelve un snmpget directo a la OLT.
-    """
-    if valor is None:
-        return None
-    texto = str(valor).strip()
-    if not texto:
-        return None
-    bajo = texto.lower()
-    if "no alarm" in bajo or "noalarm" in bajo:
-        return False
-    if "los" in bajo:
-        return True
-    if texto.lstrip("-").isdigit():
-        return _codigo_snmp(texto, config.SNMP_COD_LOS, config.SNMP_COD_SIN_LOS, "LOS")
-    return False
-
-
-def esta_offline(estado) -> bool | None:
-    """Item hwGponDeviceOntEthernetOnlineState, por historial o por SNMP crudo.
-    Mismo criterio que services/analytics._es_online, invertido."""
-    if estado is None:
-        return None
-    texto = str(estado).strip()
-    if not texto:
-        return None
-    bajo = texto.lower()
-    if "offline" in bajo:
-        return True
-    if "online" in bajo:
-        return False
-    if texto.lstrip("-").isdigit():
-        return _codigo_snmp(
-            texto, config.SNMP_COD_OFFLINE, config.SNMP_COD_ONLINE, "OnlineState"
+        Un código que no esté en ninguna de las dos listas queda en None y se
+        loguea con su valor. La regla anterior era `int(valor) != 0`, que daba
+        alarma para *cualquier* código no nulo: si la OLT contesta con un enum
+        (1 = normal, 2 = alarma, o al revés), toda ONT sana se reportaba caída y
+        de ahí la NAP entera. Un código desconocido tiene que degradar, no
+        afirmar.
+        """
+        codigo = int(texto)
+        if codigo in codigos_si:
+            return True
+        if codigo in codigos_no:
+            return False
+        log.warning(
+            "Código SNMP %s sin traducir para %s: agregalo a SNMP_COD_* en el .env",
+            codigo, metrica,
         )
-    return False
-
-
-def ont_caida(los, estado) -> bool | None:
-    """Estado de la ONT combinando las dos señales. None si no hay ninguna."""
-    señales = [s for s in (hay_los(los), esta_offline(estado)) if s is not None]
-    if not señales:
         return None
-    return any(señales)
+
+    def hay_los(self, valor) -> bool | None:
+        """Alarma óptica activa."""
+        if valor is None:
+            return None
+        texto = str(valor).strip()
+        if not texto:
+            return None
+        bajo = texto.lower()
+        if "no alarm" in bajo or "noalarm" in bajo:
+            return False
+        if "los" in bajo:
+            return True
+        if texto.lstrip("-").isdigit():
+            return self._codigo(texto, self._los, self._sin_los, "LOS")
+        return False
+
+    def esta_offline(self, estado) -> bool | None:
+        """Item hwGponDeviceOntEthernetOnlineState, por historial o por SNMP
+        crudo. Mismo criterio que services/analytics._es_online, invertido."""
+        if estado is None:
+            return None
+        texto = str(estado).strip()
+        if not texto:
+            return None
+        bajo = texto.lower()
+        if "offline" in bajo:
+            return True
+        if "online" in bajo:
+            return False
+        if texto.lstrip("-").isdigit():
+            return self._codigo(texto, self._offline, self._online, "OnlineState")
+        return False
+
+    def ont_caida(self, los, estado) -> bool | None:
+        """Estado de la ONT combinando las dos señales. None si no hay ninguna.
+
+        Va acá y no suelta porque es la misma interpretación de códigos que las
+        otras dos: si la tabla cambia, las tres cambian juntas.
+        """
+        señales = [
+            s for s in (self.hay_los(los), self.esta_offline(estado))
+            if s is not None
+        ]
+        if not señales:
+            return None
+        return any(señales)
+
+
+# La tabla del parque. Los cuatro SNMP_COD_* siguen siendo el único lugar donde
+# se declara un vendor nuevo; acá solo se arma el objeto con ellos.
+TABLA_SNMP = TablaSnmp(
+    config.SNMP_COD_LOS,
+    config.SNMP_COD_SIN_LOS,
+    config.SNMP_COD_OFFLINE,
+    config.SNMP_COD_ONLINE,
+)
+
+# Los call sites del parque usan la tabla por defecto y la nombran directo. Quien
+# necesite otra —una OLT de otro vendor, una prueba— construye su TablaSnmp.
+hay_los = TABLA_SNMP.hay_los
+esta_offline = TABLA_SNMP.esta_offline
+ont_caida = TABLA_SNMP.ont_caida
 
 
 def nap_caida(clientes_caidos, total_clientes) -> bool | None:
