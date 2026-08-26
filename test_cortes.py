@@ -811,6 +811,50 @@ def test_solo_las_senales_de_zona_se_cachean():
     assert io._zona._valores == {}
 
 
+# --- Precinto ----------------------------------------------------------------
+
+def test_nombre_cliente_sale_de_las_series_de_rx():
+    """El nombre viaja en el nombre del item, asi que solo aparece si alguna de
+    las dos series de RX trajo lecturas: logs y estado no lo seleccionan."""
+    from services import precinto as prec
+
+    assert prec.nombre_cliente([{"cliente": "JES0037"}], []) == "JES0037"
+    # Sin ONU RX cae a la serie de la OLT.
+    assert prec.nombre_cliente([], [{"cliente": "JES0099"}]) == "JES0099"
+    # Ninguna de las dos trajo lecturas: el precinto puede no existir.
+    assert prec.nombre_cliente([], []) == "No identificado"
+    # La fila vino pero la columna es nula: `cliente` esta declarado str.
+    assert prec.nombre_cliente([{"cliente": None}], []) == "No identificado"
+
+
+def test_la_respuesta_de_precinto_cumple_su_esquema_publicado():
+    """El ejemplo de /docs y el modelo tienen que decir lo mismo: hasta ahora la
+    unica documentacion de la forma de salida era el ejemplo, sin nada que lo
+    atara a lo que el endpoint devuelve."""
+    import datetime
+
+    from models import PrecintoResponse
+    from routers.precinto import EJEMPLO_RESPUESTA
+    from services import precinto as prec
+
+    PrecintoResponse(**EJEMPLO_RESPUESTA)
+
+    # Y lo que arma el modulo tambien, con un `time` de log tal como lo entrega
+    # el driver: un datetime, no el string del ejemplo.
+    payload = prec.armar_respuesta(
+        "JES0037", 6, 1785158427, 1785180027,
+        ([{"cliente": "JES0037", "onu_rx": "-21.35", "time": 1785179940}], [],
+         [{"log": "Dying-gasp", "time": datetime.datetime(2026, 7, 15, 3, 11, 11)}], []),
+    )
+    assert payload["metadata"]["cliente"] == "JES0037"
+    assert PrecintoResponse(**payload).model_dump_json()
+
+    # Un precinto sin lecturas es 200 con las cuatro listas vacias.
+    vacio = prec.armar_respuesta("NO-EXISTE", 6, 1, 2, ([], [], [], []))
+    assert vacio["metadata"]["cliente"] == "No identificado"
+    assert PrecintoResponse(**vacio).metricas.onu_rx == []
+
+
 if __name__ == "__main__":
     pruebas = [v for n, v in sorted(vars().items())
                if n.startswith("test_") and callable(v)]

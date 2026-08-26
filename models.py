@@ -1,6 +1,6 @@
 """Modelos de respuesta de los endpoints. Definen el esquema publicado en
 /docs, /redoc y /openapi.json."""
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -381,3 +381,69 @@ class CorteResponse(BaseModel):
                     "el AP o el RouterBoard del nodo no responden.",
         examples=[True],
     )
+
+
+# --- Precinto -----------------------------------------------------------------
+# Se tipa el envoltorio y la metadata, que es lo que puede divergir en silencio
+# del ejemplo publicado. Las cuatro series quedan como listas de objetos sin
+# tipar a propósito: son lecturas crudas de Zabbix, y tipar cada fila
+# convertiría un valor inesperado en un 500 sobre un endpoint de diagnóstico.
+
+
+class RangoTiempoRx(BaseModel):
+    """Ventana efectivamente aplicada. Solo afecta a las series de RX."""
+
+    desde_timestamp: int = Field(
+        description="Inicio de la ventana, epoch UNIX en segundos.",
+        examples=[1785158427],
+    )
+    hasta_timestamp: int = Field(
+        description="Fin de la ventana, epoch UNIX en segundos. Es el momento en "
+                    "que se resolvió la consulta.",
+        examples=[1785180027],
+    )
+    horas_consultadas: int = Field(
+        description="Ventana pedida, en horas.", examples=[6]
+    )
+
+
+class MetadataPrecinto(BaseModel):
+    """Identidad de la consulta y del equipo consultado."""
+
+    precinto: str = Field(
+        description="Precinto tal como se recibió en la ruta.", examples=["JES0037"]
+    )
+    cliente: str = Field(
+        description="Nombre derivado del nombre del item en el sistema de "
+                    "monitoreo. Es `No identificado` cuando ninguna de las dos "
+                    "series de RX trajo lecturas.",
+        examples=["JES0037"],
+    )
+    rango_tiempo_rx: RangoTiempoRx
+
+
+class MetricasPrecinto(BaseModel):
+    """Las cuatro series. Vacías si el precinto no registró lecturas."""
+
+    onu_rx: List[Dict[str, Any]] = Field(
+        description="Potencia óptica recibida por la ONU, truncada al minuto."
+    )
+    onu_olt_rx: List[Dict[str, Any]] = Field(
+        description="Potencia óptica con que la OLT recibe a esa ONU."
+    )
+    logs: List[Dict[str, Any]] = Field(
+        description="Registros de última causa de caída, con su fecha embebida."
+    )
+    estados: List[Dict[str, Any]] = Field(
+        description="Estado operativo reportado por la ONU."
+    )
+
+
+class PrecintoResponse(BaseModel):
+    """Respuesta de `GET /api/v1/precinto/{codigo_precinto}`."""
+
+    status: str = Field(
+        description="Resultado de la consulta.", examples=["success"]
+    )
+    metadata: MetadataPrecinto
+    metricas: MetricasPrecinto
