@@ -30,6 +30,13 @@ from services.cortes_reglas import (
 
 log = logging.getLogger(__name__)
 
+# Conexiones de zabbix que un request toma A LA VEZ: el estado de la NAP y el de
+# la ONT del cliente corren en paralelo en la primera tanda. La topología va
+# antes y sola. Lo declara este módulo y no config porque el número lo fija el
+# armado de las tandas de services/cortes.py, y un consumidor nuevo se agrega
+# acá: main.py lo suma al arrancar para verificar que el pool alcance.
+CONEXIONES_ZABBIX_POR_REQUEST = 2
+
 # Estado que es idéntico para todos los clientes de una misma caja. Ver
 # services/cache.py: lo que se cachea es el resultado final (el booleano de NAP,
 # el del ping), no las consultas intermedias, así que un hit ahorra el walk SNMP
@@ -46,7 +53,14 @@ _zona = CacheTTL(
 
 def _en_paralelo(tareas: dict) -> dict:
     """Corre {nombre: callable} en hilos. Una tarea que falla queda en None y no
-    arrastra a las demás."""
+    arrastra a las demás.
+
+    El pool se crea por llamada a propósito, y no conviene compartir uno global:
+    estas llamadas se anidan. `estado_nap` corre como tarea acá adentro y por
+    dentro vuelve a entrar por `_nap_por_snmp` -> `_valores_snmp` -> acá. Con un
+    pool compartido y acotado, las tareas de afuera ocupan todos los slots
+    esperando a las de adentro, que nunca consiguen uno: deadlock.
+    """
     if not tareas:
         return {}
     resultados = {}

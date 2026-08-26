@@ -908,6 +908,35 @@ def test_toda_respuesta_de_error_documenta_su_cuerpo():
     assert revisadas >= 15, f"solo se revisaron {revisadas} respuestas de error"
 
 
+def test_el_presupuesto_del_pool_de_zabbix_avisa_cuando_no_cierra():
+    """La relacion entre CORTES_MAX_CONCURRENTES y POOL_MAX vivia en un
+    comentario de config.py que nombraba un solo consumidor y traia un numero
+    desactualizado. Ahora cada modulo declara el suyo y esto verifica la cuenta."""
+    import main
+
+    # Los defaults del repo cierran justo en el borde: 5 x 2 = 10 = POOL_MAX.
+    assert main.revisar_presupuesto_zabbix(10, 5, 2) is None
+    assert main.revisar_presupuesto_zabbix(20, 5, 2) is None
+
+    # Un escalon mas de admision ya no entra, y el aviso dice a cuanto bajar.
+    aviso = main.revisar_presupuesto_zabbix(10, 6, 2)
+    assert aviso and "CORTES_MAX_CONCURRENTES a 5" in aviso
+
+    # Y si cortes pasara a tomar tres conexiones, el tope actual tampoco entra.
+    assert main.revisar_presupuesto_zabbix(10, 5, 3) is not None
+
+    # Los tres consumidores estan declarados por su propio modulo.
+    assert set(main.CONSUMIDORES_ZABBIX) == {"cortes", "analytics", "precinto"}
+    assert all(c >= 1 for c in main.CONSUMIDORES_ZABBIX.values())
+
+    # Y la configuracion que se va a desplegar tiene que cerrar.
+    assert main.revisar_presupuesto_zabbix(
+        config.POOL_MAX,
+        config.CORTES_MAX_CONCURRENTES,
+        main.CONSUMIDORES_ZABBIX["cortes"],
+    ) is None, "los defaults del repo no cierran"
+
+
 if __name__ == "__main__":
     pruebas = [v for n, v in sorted(vars().items())
                if n.startswith("test_") and callable(v)]

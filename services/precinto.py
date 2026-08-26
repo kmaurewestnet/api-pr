@@ -16,6 +16,9 @@ from queries.precinto import QUERY_ESTADO, QUERY_LOGS, QUERY_OLT_RX, QUERY_ONU_R
 
 log = logging.getLogger(__name__)
 
+# Las cuatro consultas van secuenciales sobre una sola conexión. Ver main.py.
+CONEXIONES_ZABBIX_POR_REQUEST = 1
+
 SIN_IDENTIFICAR = "No identificado"
 
 

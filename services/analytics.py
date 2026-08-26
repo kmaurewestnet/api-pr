@@ -23,6 +23,11 @@ from queries import analytics as q
 
 log = logging.getLogger(__name__)
 
+# Conexiones de zabbix que un request toma a la vez: `obtener_metricas` corre
+# estado+LOS y LDC en paralelo, una conexión cada una. Eran tres hasta que
+# estado y LOS se unificaron en una sola consulta. Ver main.py.
+CONEXIONES_ZABBIX_POR_REQUEST = 2
+
 _ESPACIOS = re.compile(r"\s+")
 
 

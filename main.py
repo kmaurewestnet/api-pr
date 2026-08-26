@@ -12,17 +12,67 @@ import config
 import db
 from models import ERRORES_AUTENTICACION
 from routers import analytics, cortes, precinto
-from services import red
+from services import (
+    analytics as servicio_analytics,
+    cortes_io,
+    precinto as servicio_precinto,
+    red,
+)
 from security import verificar_api_key, verificar_api_key_docs
 
 config.setup_logging()
 log = logging.getLogger(__name__)
 
 
+# Los tres consumidores del pool de zabbix, con lo que toma cada uno a la vez.
+# Cada módulo declara el suyo: la cuenta se hacía en un comentario de config.py
+# que nombraba a un solo endpoint y con un número que ya se había quedado viejo.
+CONSUMIDORES_ZABBIX = {
+    "cortes": cortes_io.CONEXIONES_ZABBIX_POR_REQUEST,
+    "analytics": servicio_analytics.CONEXIONES_ZABBIX_POR_REQUEST,
+    "precinto": servicio_precinto.CONEXIONES_ZABBIX_POR_REQUEST,
+}
+
+
+def revisar_presupuesto_zabbix(pool_max, concurrentes, por_request):
+    """Aviso si el tope de admisión de cortes no entra en el pool de zabbix.
+
+    Solo se verifica cortes: es el único endpoint con control de admisión, así
+    que es el único cuya demanda máxima es un número nuestro. Analytics y
+    precinto los acota el threadpool de FastAPI, y cuando el pool se agota salen
+    por 503 en vez de responder sobre datos que no consultaron.
+
+    Devuelve el aviso, o None si los números cierran. No aborta el arranque: un
+    operador que sube la concurrencia durante un incidente no debería quedarse
+    sin API por eso.
+    """
+    demanda = concurrentes * por_request
+    if demanda <= pool_max:
+        return None
+    return (
+        f"CORTES_MAX_CONCURRENTES={concurrentes} por {por_request} conexiones de "
+        f"zabbix da {demanda}, y POOL_MAX={pool_max}. Bajo carga, cortes va a "
+        f"agotar el pool y los requests van a salir por 503: bajá "
+        f"CORTES_MAX_CONCURRENTES a {pool_max // por_request} o subí POOL_MAX."
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    aviso = revisar_presupuesto_zabbix(
+        config.POOL_MAX,
+        config.CORTES_MAX_CONCURRENTES,
+        CONSUMIDORES_ZABBIX["cortes"],
+    )
+    if aviso:
+        log.warning("Presupuesto del pool de zabbix: %s", aviso)
+    log.info(
+        "Pool de zabbix: POOL_MAX=%d | conexiones simultáneas por request: %s",
+        config.POOL_MAX,
+        ", ".join(f"{n}={c}" for n, c in CONSUMIDORES_ZABBIX.items()),
+    )
     # Los pools se crean de forma diferida al primer uso (ver db.py), así que
-    # acá solo hace falta liberarlos al apagar.
+    # al apagar solo hace falta liberarlos.
     yield
     cortes.cerrar_ejecutor()
     db.close_all()

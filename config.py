@@ -192,8 +192,10 @@ LOS_VIGENTE_SEG = _int("LOS_VIGENTE_DIAS", 7) * 86400
 CHUNK_SIZE = _int("QUERY_CHUNK_SIZE", 50000)
 # Corta una consulta colgada en Zabbix en vez de dejar la conexión tomada.
 STATEMENT_TIMEOUT_MS = _int("STATEMENT_TIMEOUT_MS", 120000)
-# Tamaño de los pools de PostgreSQL. El endpoint de analíticas usa 3 conexiones
-# simultáneas de zabbix (RX, estado y LOS en paralelo).
+# Tamaño de los pools de PostgreSQL. Cuántas conexiones de zabbix toma cada
+# endpoint a la vez lo declara su propio módulo, en CONEXIONES_ZABBIX_POR_REQUEST:
+# repetir el número acá ya hizo que quedara viejo una vez. main.py verifica al
+# arrancar que el pool alcance para el tope de admisión de cortes.
 POOL_MIN = _int("POOL_MIN", 1)
 POOL_MAX = _int("POOL_MAX", 10)
 
