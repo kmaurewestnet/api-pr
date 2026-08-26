@@ -5,7 +5,12 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 import db
-from models import ERROR_RATE_LIMIT, ERRORES_AUTENTICACION_INTERNA, PrecintoResponse
+from models import (
+    ERROR_RATE_LIMIT,
+    ERRORES_AUTENTICACION_INTERNA,
+    PrecintoResponse,
+    error,
+)
 from security import limitar_tasa_interna
 from services import precinto as svc
 
@@ -58,30 +63,16 @@ EJEMPLO_RESPUESTA = {
         },
         **ERRORES_AUTENTICACION_INTERNA,
         **ERROR_RATE_LIMIT,
-        500: {
-            "description": (
-                "Error inesperado durante el procesamiento de los datos "
-                "obtenidos del sistema de monitoreo."
-            ),
-            "content": {
-                "application/json": {
-                    "example": {"detail": "Error al procesar los datos en Zabbix"}
-                }
-            },
-        },
-        503: {
-            "description": (
-                "La base del sistema de monitoreo de fibra no responde. "
-                "`/health` detalla el estado de cada dependencia."
-            ),
-            "content": {
-                "application/json": {
-                    "example": {
-                        "detail": "Error interno de conexión a la base de datos"
-                    }
-                }
-            },
-        },
+        500: error(
+            "Error inesperado durante el procesamiento de los datos obtenidos "
+            "del sistema de monitoreo.",
+            "Error al procesar los datos en Zabbix",
+        ),
+        503: error(
+            "La base del sistema de monitoreo de fibra no responde. `/health` "
+            "detalla el estado de cada dependencia.",
+            "Error interno de conexión a la base de datos",
+        ),
     },
 )
 def obtener_datos_completos_precinto(

@@ -10,7 +10,7 @@ import db
 from models import (
     ERROR_RATE_LIMIT,
     ERRORES_AUTENTICACION_INTERNA,
-    AnalyticsResponse,
+    AnalyticsResponse,    error,
 )
 from security import limitar_tasa_interna
 from services import analytics as svc
@@ -60,19 +60,11 @@ def _stream(metadata, resumen, dispositivos):
         },
         **ERRORES_AUTENTICACION_INTERNA,
         **ERROR_RATE_LIMIT,
-        404: {
-            "description": (
-                "La empresa no registra dispositivos asociados en el sistema de "
-                "reservas."
-            ),
-            "content": {
-                "application/json": {
-                    "example": {
-                        "detail": "La empresa 34 no tiene dispositivos asociados en napear"
-                    }
-                }
-            },
-        },
+        404: error(
+            "La empresa no registra dispositivos asociados en el sistema de "
+            "reservas.",
+            "La empresa 34 no tiene dispositivos asociados en napear",
+        ),
         422: {
             "description": (
                 "Un parámetro está fuera de rango, o `estado` no corresponde a "
@@ -106,41 +98,21 @@ def _stream(metadata, resumen, dispositivos):
                 }
             },
         },
-        500: {
-            "description": "Error inesperado durante el cálculo de las analíticas.",
-            "content": {
-                "application/json": {
-                    "example": {
-                        "detail": "Error al procesar las analíticas de la empresa"
-                    }
-                }
-            },
-        },
-        501: {
-            "description": (
-                "Faltan definir consultas SQL en `queries/analytics.py`. Constituye "
-                "un error de despliegue, no del request."
-            ),
-            "content": {
-                "application/json": {
-                    "example": {
-                        "detail": "Faltan definir las consultas SQL en "
-                                  "queries/analytics.py: Q_NAPEAR_ONTS_POR_EMPRESA"
-                    }
-                }
-            },
-        },
-        503: {
-            "description": (
-                "Alguna de las tres bases involucradas (reservas, inventario de red "
-                "o monitoreo de fibra) no responde. `/health` identifica cuál."
-            ),
-            "content": {
-                "application/json": {
-                    "example": {"detail": "La base napear no está disponible"}
-                }
-            },
-        },
+        500: error(
+            "Error inesperado durante el cálculo de las analíticas.",
+            "Error al procesar las analíticas de la empresa",
+        ),
+        501: error(
+            "Faltan definir consultas SQL en `queries/analytics.py`. Constituye "
+            "un error de despliegue, no del request.",
+            "Faltan definir las consultas SQL en queries/analytics.py: "
+            "Q_NAPEAR_ONTS_POR_EMPRESA",
+        ),
+        503: error(
+            "Alguna de las tres bases involucradas (reservas, inventario de red o "
+            "monitoreo de fibra) no responde. `/health` identifica cuál.",
+            "La base napear no está disponible",
+        ),
     },
 )
 def analiticas_empresa(

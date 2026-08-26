@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Path
 
 import config
 import db
-from models import ERROR_RATE_LIMIT, ERRORES_AUTENTICACION, CorteResponse
+from models import ERROR_RATE_LIMIT, ERRORES_AUTENTICACION, CorteResponse, error
 from security import limitar_tasa
 from services import cortes as svc
 
@@ -54,75 +54,40 @@ def cerrar_ejecutor() -> None:
             )
         },
         **ERRORES_AUTENTICACION,
-        404: {
-            "description": (
-                "El cliente no existe, no registra contrato activo, o su plan no "
-                "corresponde a las categorías contempladas (fibra o wireless)."
-            ),
-            "content": {
-                "application/json": {
-                    "example": {
-                        "detail": "No se encontró el cliente 302381 con un contrato "
-                                  "activo en las categorías contempladas"
-                    }
-                }
-            },
-        },
-        422: {
-            "description": (
-                f"`numero_cliente` no es numérico o excede los {MAX_LARGO_CLIENTE} "
-                "dígitos."
-            ),
-            "content": {
-                "application/json": {
-                    "example": {
-                        "detail": "El número de cliente debe ser numérico y de "
-                                  f"hasta {MAX_LARGO_CLIENTE} dígitos"
-                    }
-                }
-            },
-        },
+        404: error(
+            "El cliente no existe, no registra contrato activo, o su plan no "
+            "corresponde a las categorías contempladas (fibra o wireless).",
+            "No se encontró el cliente 302381 con un contrato activo en las "
+            "categorías contempladas",
+        ),
+        422: error(
+            f"`numero_cliente` no es numérico o excede los {MAX_LARGO_CLIENTE} "
+            "dígitos.",
+            f"El número de cliente debe ser numérico y de hasta "
+            f"{MAX_LARGO_CLIENTE} dígitos",
+        ),
         # ponytail: el 422 de este endpoint siempre lo emite la validación
         # propia (el parámetro de ruta es str, así que FastAPI no lo rechaza),
         # por eso acá va un solo ejemplo y no dos como en analytics.
         **ERROR_RATE_LIMIT,
-        500: {
-            "description": "Error inesperado durante la resolución del diagnóstico.",
-            "content": {
-                "application/json": {
-                    "example": {"detail": "Error al procesar la detección de corte"}
-                }
-            },
-        },
-        503: {
-            "description": (
-                "La base de administración, o el sistema de monitoreo correspondiente "
-                "a la tecnología del cliente, no responde. Sin ese dato la "
-                "respuesta carecería de respaldo, por lo que se rechaza el "
-                "request en lugar de devolver booleanos no verificados."
-            ),
-            "content": {
-                "application/json": {
-                    "example": {"detail": "La base gestion no está disponible"}
-                }
-            },
-        },
-        504: {
-            "description": (
-                f"La detección superó los {config.CORTES_TIMEOUT_SEG}s "
-                "(`CORTES_TIMEOUT_SEG`). Habitualmente indica latencia elevada "
-                "en una OLT o en una base de datos, o una cola de requests "
-                "superior al tope de concurrencia."
-            ),
-            "content": {
-                "application/json": {
-                    "example": {
-                        "detail": f"La detección superó los "
-                                  f"{config.CORTES_TIMEOUT_SEG}s"
-                    }
-                }
-            },
-        },
+        500: error(
+            "Error inesperado durante la resolución del diagnóstico.",
+            "Error al procesar la detección de corte",
+        ),
+        503: error(
+            "La base de administración, o el sistema de monitoreo correspondiente "
+            "a la tecnología del cliente, no responde. Sin ese dato la respuesta "
+            "carecería de respaldo, por lo que se rechaza el request en lugar de "
+            "devolver booleanos no verificados.",
+            "La base gestion no está disponible",
+        ),
+        504: error(
+            f"La detección superó los {config.CORTES_TIMEOUT_SEG}s "
+            "(`CORTES_TIMEOUT_SEG`). Habitualmente indica latencia elevada en una "
+            "OLT o en una base de datos, o una cola de requests superior al tope "
+            "de concurrencia.",
+            f"La detección superó los {config.CORTES_TIMEOUT_SEG}s",
+        ),
     },
 )
 async def detectar_corte(

@@ -20,8 +20,12 @@ class ErrorDetalle(BaseModel):
     )
 
 
-def _error(descripcion: str, ejemplo: str) -> dict:
-    """Entrada del dict `responses` de un endpoint, con su ejemplo."""
+def error(descripcion: str, ejemplo: str) -> dict:
+    """Entrada del dict `responses` de un endpoint, con su ejemplo.
+
+    Toda respuesta de error de la API tiene la misma forma —`{"detail": ...}`—
+    así que la forma se escribe una vez acá y no en cada decorador.
+    """
     return {
         "model": ErrorDetalle,
         "description": descripcion,
@@ -33,7 +37,7 @@ def _error(descripcion: str, ejemplo: str) -> dict:
 # importar su lógica. Se reparten con `**ERRORES_AUTENTICACION` para no repetir
 # el mismo bloque en cada decorador.
 ERRORES_AUTENTICACION = {
-    403: _error(
+    403: error(
         "API Key ausente o inválida en la cabecera `X-API-Key`.",
         "No autorizado. API Key inválida o ausente en la cabecera X-API-Key.",
     ),
@@ -42,7 +46,7 @@ ERRORES_AUTENTICACION = {
 # Precinto y analiticas suman un segundo motivo de 403: la clave es valida pero
 # es la de un consumidor externo, limitado a /cortes.
 ERRORES_AUTENTICACION_INTERNA = {
-    403: _error(
+    403: error(
         "API Key ausente o inválida, o válida pero correspondiente a un "
         "consumidor externo: `/precinto` y `/analytics` son endpoints internos.",
         "Esta clave solo tiene acceso al endpoint de cortes.",
@@ -50,7 +54,7 @@ ERRORES_AUTENTICACION_INTERNA = {
 }
 
 ERROR_RATE_LIMIT = {
-    429: _error(
+    429: error(
         "Rate limit del consumidor alcanzado. La respuesta incluye la cabecera "
         "`Retry-After` con los segundos a esperar.",
         "Límite de 60 consultas por minuto alcanzado",

@@ -874,6 +874,40 @@ def test_la_respuesta_de_precinto_cumple_su_esquema_publicado():
     assert PrecintoResponse(**vacio).metricas.onu_rx == []
 
 
+def test_toda_respuesta_de_error_documenta_su_cuerpo():
+    """La forma `{"detail": ...}` se arma con models.error() y no a mano en cada
+    decorador. Esto vigila la entrada SIGUIENTE: una que se escriba literal se
+    olvida del `model`, del ejemplo, o de los dos, y /docs la publica vacia."""
+    import main
+
+    esquema = main.app.openapi()
+    revisadas, sin_ejemplo = 0, []
+    for ruta, operaciones in esquema["paths"].items():
+        for metodo, operacion in operaciones.items():
+            for codigo, respuesta in operacion.get("responses", {}).items():
+                if not codigo.startswith(("4", "5")):
+                    continue
+                cuerpo = (respuesta.get("content") or {}).get("application/json") or {}
+                ref = (cuerpo.get("schema") or {}).get("$ref", "")
+                # El 422 generico lo genera FastAPI con su propio modelo.
+                if ref.endswith("HTTPValidationError"):
+                    continue
+                revisadas += 1
+                if "examples" in cuerpo:
+                    casos = [c["value"] for c in cuerpo["examples"].values()]
+                elif "example" in cuerpo:
+                    casos = [cuerpo["example"]]
+                else:
+                    sin_ejemplo.append(f"{metodo.upper()} {ruta} -> {codigo}")
+                    continue
+                for caso in casos:
+                    assert "detail" in caso, f"{ruta} {codigo}: el ejemplo no trae detail"
+
+    assert not sin_ejemplo, f"respuestas de error sin ejemplo: {sin_ejemplo}"
+    # Y que no pase en vacio si alguien rompe el recorrido del esquema.
+    assert revisadas >= 15, f"solo se revisaron {revisadas} respuestas de error"
+
+
 if __name__ == "__main__":
     pruebas = [v for n, v in sorted(vars().items())
                if n.startswith("test_") and callable(v)]
