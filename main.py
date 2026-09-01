@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 
 from urllib.parse import quote
 
-from fastapi import Depends, FastAPI, Query
+from fastapi import Depends, FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
 from fastapi.responses import JSONResponse
@@ -18,7 +18,7 @@ from services import (
     precinto as servicio_precinto,
     red,
 )
-from security import verificar_api_key, verificar_api_key_docs
+from security import es_externo, verificar_api_key, verificar_api_key_docs
 
 config.setup_logging()
 log = logging.getLogger(__name__)
@@ -135,7 +135,7 @@ cualquier otro endpoint responde `403`.
 | `GET /api/v1/cortes/{n}` | internas y externas | un cliente |
 | `GET /api/v1/precinto/{c}` | sólo internas | una ONU (varias si el código es parcial) |
 | `GET /api/v1/empresa/{id}/analytics` | sólo internas | el parque completo de una empresa |
-| `GET /health` | internas y externas | estado del servicio |
+| `GET /health` | internas y externas | estado del servicio. Las externas reciben **solo** `status`; el detalle por base es para las internas |
 
 El precinto se compara como **texto literal**: los metacaracteres carecen de
 significado especial.
@@ -163,6 +163,19 @@ alcanzan claves internas.
 Al agotarse la cuota se responde `429` con la cabecera `Retry-After` expresada
 en segundos.
 
+**Toda respuesta** de un endpoint con cuota —no únicamente el `429`— incluye el
+estado del límite, para que el consumidor pueda regularse antes de chocar contra
+él y no después:
+
+| Cabecera | Significado |
+|---|---|
+| `X-RateLimit-Limit` | Cuota del consumidor, en requests por minuto |
+| `X-RateLimit-Remaining` | Requests disponibles **con el actual ya descontado** |
+| `X-RateLimit-Reset` | Epoch UNIX en el que vuelve a haber al menos un request disponible |
+
+Con la cuota desactivada (valor `0`) las tres cabeceras se omiten: su ausencia
+indica que no hay límite que informar.
+
 El límite tiene mayor relevancia que en una API convencional: **un único request
 a `/cortes` puede originar decenas de consultas SNMP contra una OLT en
 producción**, por lo que una iteración sobre números de cliente afecta a la red
@@ -181,7 +194,7 @@ valor es exacto.
 | `422` | Un parámetro no cumple el formato o el rango esperado |
 | `429` | Rate limit del consumidor alcanzado |
 | `500` | Error inesperado durante el procesamiento |
-| `503` | Alguna base de datos no responde — `/health` indica cuál |
+| `503` | Una dependencia no responde. El cuerpo es siempre el mismo: cuál falló se consulta en `/health` y queda en el log, no viaja en la respuesta |
 | `504` | La detección de corte superó su tope de tiempo |
 
 Todas las respuestas de error comparten el mismo cuerpo: `{"detail": "<motivo>"}`.
@@ -277,6 +290,22 @@ if config.CORS_ORIGINS:
         max_age=3600,
     )
 
+@app.middleware("http")
+async def poner_headers_de_limite(request: Request, call_next):
+    """Copia los `X-RateLimit-*` que dejó el rate limit sobre la respuesta final.
+
+    Va acá y no en la dependencia porque un Response construido a mano no hereda
+    los headers del que FastAPI inyecta: lo reemplaza entero. Eso alcanza al
+    streaming de analíticas y a **toda** respuesta de error, que se arman desde
+    la HTTPException. Desde el middleware el header sale igual en un 200, en un
+    503 y en el 429, que es la única forma de que un consumidor pueda leer
+    siempre cuánta cuota le queda.
+    """
+    respuesta = await call_next(request)
+    respuesta.headers.update(getattr(request.state, "headers_de_limite", {}))
+    return respuesta
+
+
 app.include_router(precinto.router)
 app.include_router(analytics.router)
 app.include_router(cortes.router)
@@ -332,21 +361,27 @@ def redoc_protegido(key: str = Query(default=None)):
     tags=["infra"],
     summary="Estado de la API y de sus dependencias",
     response_description=(
-        "Estado global ('success' o 'degraded') más el detalle por base de datos "
-        "y por utilidad del sistema"
+        "Estado global ('success' o 'degraded'). Con una clave interna incluye "
+        "además el detalle por base de datos y por utilidad del sistema"
     ),
-    dependencies=[Depends(verificar_api_key)],
     responses={
         200: {
             "description": (
                 "Verificación realizada. **Siempre 200, incluso con 'degraded'**: "
                 "el código HTTP indica que la verificación pudo ejecutarse, no "
                 "que todas las dependencias estén operativas. El estado real se "
-                "determina por el campo `status`."
+                "determina por el campo `status`.\n\n"
+                "El cuerpo depende del alcance de la clave: **las externas "
+                "reciben únicamente `status`**. Enumerar las bases y devolver el "
+                "error del driver es describir la infraestructura, y para decidir "
+                "si reintentar alcanza con saber que el servicio está degradado."
             ),
             "content": {
                 "application/json": {
-                    "example": {
+                    "examples": {
+                      "interna": {
+                        "summary": "Clave interna — detalle completo",
+                        "value": {
                         "status": "degraded",
                         "environment": "production",
                         "bases": {
@@ -363,6 +398,12 @@ def redoc_protegido(key: str = Query(default=None)):
                             "ping": {"ok": True},
                             "snmpget": {"ok": True},
                         },
+                        },
+                      },
+                      "externa": {
+                        "summary": "Clave externa — solo el estado global",
+                        "value": {"status": "degraded"},
+                      },
                     }
                 }
             },
@@ -370,7 +411,7 @@ def redoc_protegido(key: str = Query(default=None)):
         **ERRORES_AUTENTICACION,
     },
 )
-def health():
+def health(consumidor: str = Depends(verificar_api_key)):
     """Verifica la conectividad de la API con la totalidad de sus dependencias.
 
     Ejecuta un `ping` de conexión contra cada una de las cinco bases de datos y
@@ -382,7 +423,9 @@ def health():
     **Devuelve** un objeto con:
 
     * `status`: `"success"` si todas las dependencias responden, `"degraded"` si
-      falla al menos una base o una utilidad.
+      falla al menos una base o una utilidad. **Es el único campo que reciben las
+      claves externas**: la lista de bases y el mensaje del driver describen la
+      infraestructura, y para decidir si reintentar no hacen falta.
     * `environment`: entorno declarado en la variable `ENVIRONMENT`.
     * `bases`: por cada base, un `{"ok": bool}` y, cuando falla, el `error`
       devuelto por el driver.
@@ -412,8 +455,14 @@ def health():
     todo_ok = all(v["ok"] for v in resultado.values()) and all(
         u["ok"] for u in utilidades.values()
     )
+    estado = "success" if todo_ok else "degraded"
+    if es_externo(consumidor):
+        # Sí o no, sin el mapa: qué bases existen, cuáles se cayeron y qué
+        # contesta el driver es infraestructura. Para reintentar alcanza con
+        # saber que está degradado.
+        return {"status": estado}
     return {
-        "status": "success" if todo_ok else "degraded",
+        "status": estado,
         "environment": config.ENVIRONMENT,
         "bases": resultado,
         "utilidades": utilidades,

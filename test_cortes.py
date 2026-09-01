@@ -937,6 +937,135 @@ def test_el_presupuesto_del_pool_de_zabbix_avisa_cuando_no_cierra():
     ) is None, "los defaults del repo no cierran"
 
 
+def test_toda_respuesta_lleva_los_headers_de_rate_limit():
+    """Sin `X-RateLimit-Remaining` un consumidor no puede autorregularse: solo
+    puede chocar contra el limite y leer el Retry-After. Los headers van en toda
+    respuesta, no solo en el 429."""
+    import security
+    from fastapi import HTTPException
+    from starlette.datastructures import State
+
+    class RequestFalso:
+        def __init__(self):
+            self.state = State()
+
+    previo = security._limite
+    try:
+        security._limite = security.CubetaDeTokens(por_minuto=60, burst=2)
+
+        r = RequestFalso()
+        assert security.limitar_tasa("noc", r) == "noc"
+        h = r.state.headers_de_limite
+        assert h["X-RateLimit-Limit"] == "60"
+        # Con burst 2 y un token descontado queda 1.
+        assert h["X-RateLimit-Remaining"] == "1"
+        assert int(h["X-RateLimit-Reset"]) > 0
+
+        # El contador baja request a request y no se queda clavado.
+        r2 = RequestFalso()
+        security.limitar_tasa("noc", r2)
+        assert r2.state.headers_de_limite["X-RateLimit-Remaining"] == "0"
+
+        # Y el 429 los lleva tambien, junto al Retry-After: es justo cuando el
+        # consumidor mas necesita saber cuanto falta.
+        try:
+            security.limitar_tasa("noc", RequestFalso())
+            assert False, "el tercer request tendria que dar 429"
+        except HTTPException as e:
+            assert e.status_code == 429
+            assert e.headers["Retry-After"]
+            assert e.headers["X-RateLimit-Remaining"] == "0"
+
+        # Con el limite desactivado no hay nada que informar: el header ausente
+        # es mas honesto que uno que diga "infinito".
+        security._limite = security.CubetaDeTokens(por_minuto=0, burst=1)
+        r3 = RequestFalso()
+        security.limitar_tasa("noc", r3)
+        assert r3.state.headers_de_limite == {}
+    finally:
+        security._limite = previo
+
+
+def test_el_503_no_revela_nada_de_la_infraestructura():
+    """El 503 de /cortes lo ve un consumidor externo. Ni el texto del driver
+    —host, puerto, usuario— ni el nombre de la base: que se haya caido napear o
+    gestion es topologia interna. Cual fallo va al log y a /health."""
+    del_driver = ('could not connect to server: 10.20.0.5:5432 FATAL: password '
+                  'authentication failed for user "zabbix_ro"')
+    prohibido = ("10.20.0.5", "5432", "password", "zabbix_ro", "FATAL",
+                 "napear", "gestion", "soldef", "zabbix", "postgres", "mysql",
+                 "pool", "POOL_MAX")
+
+    for e in (db.DatabaseUnavailable("gestion"), db.PoolAgotado("zabbix")):
+        cuerpo = str(e).lower()
+        for filtrado in prohibido:
+            assert filtrado.lower() not in cuerpo, f"el 503 revela '{filtrado}'"
+        assert del_driver not in str(e)
+        # Mismo cuerpo para las cinco bases y para el pool agotado: si variara
+        # segun la causa, la diferencia sola ya seria informacion.
+        assert str(e) == db.SERVICIO_NO_DISPONIBLE
+
+    # El nombre viaja aparte, para las lineas de log de quien opera.
+    assert db.DatabaseUnavailable("gestion").nombre == "gestion"
+    assert db.PoolAgotado("zabbix").nombre == "zabbix"
+    # PoolAgotado sigue siendo un 503, no un "no se pudo verificar".
+    assert issubclass(db.PoolAgotado, db.DatabaseUnavailable)
+
+
+def test_health_no_le_da_el_mapa_a_una_clave_externa():
+    """/health lo alcanzan las claves externas, y es el endpoint que enumera las
+    cinco bases y devuelve el texto del driver: el mapa entero de una. Para
+    decidir si reintentar alcanza con el estado global."""
+    import security
+    from fastapi.testclient import TestClient
+    import main
+
+    previo_claves, previo_solo = security._CLAVES, security._SOLO_CORTES
+    try:
+        security._CLAVES = {"k-noc": "noc", "k-chatbot": "chatbot"}
+        security._SOLO_CORTES = {"chatbot"}
+        c = TestClient(main.app)
+
+        externo = c.get("/health", headers={"X-API-Key": "k-chatbot"})
+        assert externo.status_code == 200, externo.status_code
+        # Solo el estado: ni las bases, ni el entorno, ni el error del driver.
+        assert set(externo.json()) == {"status"}, externo.json()
+        crudo = externo.text.lower()
+        for filtrado in ("napear", "gestion", "soldef", "zabbix", "environment"):
+            assert filtrado not in crudo, f"/health revela '{filtrado}' a un externo"
+
+        # Al NOC, que es quien lo tiene que diagnosticar, no se le esconde nada.
+        interno = c.get("/health", headers={"X-API-Key": "k-noc"})
+        assert interno.status_code == 200
+        cuerpo = interno.json()
+        assert set(cuerpo) == {"status", "environment", "bases", "utilidades"}
+        assert set(cuerpo["bases"]) == {
+            "zabbix", "zabbix_wireless", "soldef", "napear", "gestion"
+        }
+
+        # Y el estado global es el mismo para los dos: se acota el detalle, no
+        # se le miente a nadie sobre si el servicio esta sano.
+        assert externo.json()["status"] == cuerpo["status"]
+    finally:
+        security._CLAVES, security._SOLO_CORTES = previo_claves, previo_solo
+
+
+def test_el_501_no_nombra_archivos_ni_constantes():
+    """Que falten consultas SQL es un error de despliegue. Cuales faltan, y en
+    que archivo, es estructura interna: va al log, no al cuerpo."""
+    from routers import analytics as router_analytics
+    from services.analytics import QueriesNoConfiguradas
+
+    e = QueriesNoConfiguradas(["Q_NAPEAR_ONTS_POR_EMPRESA"])
+    # El detalle sigue existiendo para el log y para quien despliega.
+    assert "Q_NAPEAR_ONTS_POR_EMPRESA" in str(e)
+    assert e.faltantes == ["Q_NAPEAR_ONTS_POR_EMPRESA"]
+
+    cuerpo = router_analytics.ENDPOINT_NO_CONFIGURADO
+    for filtrado in ("queries/analytics.py", "Q_NAPEAR", "queries", ".py"):
+        assert filtrado not in cuerpo, f"el 501 revela '{filtrado}'"
+
+
 if __name__ == "__main__":
     pruebas = [v for n, v in sorted(vars().items())
                if n.startswith("test_") and callable(v)]

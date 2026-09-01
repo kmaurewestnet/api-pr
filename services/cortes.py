@@ -86,9 +86,7 @@ def _obligatoria(base, fn, *args):
         raise
     except Exception as e:
         log.exception("Fallo la consulta obligatoria a %s: %s", base, e)
-        raise db.DatabaseUnavailable(
-            f"Base de datos '{base}' no disponible"
-        ) from e
+        raise db.DatabaseUnavailable(base) from e
 
 
 def buscar_cliente(nro_cliente: str) -> dict:

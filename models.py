@@ -56,7 +56,8 @@ ERRORES_AUTENTICACION_INTERNA = {
 ERROR_RATE_LIMIT = {
     429: error(
         "Rate limit del consumidor alcanzado. La respuesta incluye la cabecera "
-        "`Retry-After` con los segundos a esperar.",
+        "`Retry-After` con los segundos a esperar. Los `X-RateLimit-*` van en "
+        "toda respuesta, no solo en esta.",
         "Límite de 60 consultas por minuto alcanzado",
     ),
 }

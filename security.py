@@ -11,7 +11,7 @@ import logging
 import threading
 import time
 
-from fastapi import Depends, HTTPException, Query
+from fastapi import Depends, HTTPException, Query, Request
 from fastapi.security import APIKeyHeader
 
 import config
@@ -144,6 +144,17 @@ def verificar_api_key(api_key: str = Depends(api_key_header)) -> str:
     raise NO_AUTORIZADO
 
 
+def es_externo(consumidor: str) -> bool:
+    """Si la clave está limitada a /cortes.
+
+    Lo consulta `/health`, que es el otro endpoint que alcanzan las claves
+    externas: la lista de bases y el error del driver son el mapa de la
+    infraestructura, y ahí `403` sería demasiado —un consumidor externo tiene
+    derecho a saber si la API está en pie— pero el detalle no le corresponde.
+    """
+    return consumidor in _SOLO_CORTES
+
+
 def verificar_api_key_interna(consumidor: str = Depends(verificar_api_key)) -> str:
     """Igual que `verificar_api_key`, pero le cierra la puerta a los externos.
 
@@ -211,6 +222,25 @@ class CubetaDeTokens:
         """Limite efectivo, para poder nombrarlo en el 429 sin mentir."""
         return round(self._cuota(consumidor)[0] * 60)
 
+    def estado_de(self, consumidor: str):
+        """(limite_por_minuto, tokens_restantes, epoch_de_recarga), o None si el
+        limite esta desactivado.
+
+        Es lo que van a leer los headers `X-RateLimit-*`. Se lee siempre despues
+        de `consumir`, que acaba de actualizar `_estado`: el numero refleja lo
+        que le queda al consumidor **con este request ya descontado**, que es lo
+        que necesita para autorregularse.
+        """
+        tasa, capacidad = self._cuota(consumidor)
+        if tasa <= 0:
+            return None
+        with self._lock:
+            tokens, _ = self._estado.get(consumidor, (capacidad, time.monotonic()))
+        # Con menos de un token no queda ninguno entero disponible, y la recarga
+        # util es la del proximo: el mismo numero que sale por Retry-After.
+        faltan = 0.0 if tokens >= 1 else (1 - tokens) / tasa
+        return round(tasa * 60), int(tokens), int(time.time() + faltan)
+
     def consumir(self, consumidor: str):
         """(permitido, segundos_de_espera)."""
         tasa, capacidad = self._cuota(consumidor)
@@ -239,7 +269,28 @@ _limite_interno = CubetaDeTokens(
 )
 
 
-def _descontar(cubeta: CubetaDeTokens, consumidor: str) -> str:
+def headers_de_limite(cubeta: CubetaDeTokens, consumidor: str) -> dict:
+    """Los tres `X-RateLimit-*`, o vacio si el limite esta desactivado.
+
+    Van en toda respuesta, no solo en el 429: sin `Remaining` un consumidor no
+    tiene forma de autorregularse, solo puede chocar contra el limite y esperar
+    el `Retry-After`. Es publico porque el streaming de analiticas devuelve su
+    propio Response y tiene que copiarlos a mano.
+    """
+    estado = cubeta.estado_de(consumidor)
+    if estado is None:
+        return {}
+    limite, restantes, recarga = estado
+    return {
+        "X-RateLimit-Limit": str(limite),
+        "X-RateLimit-Remaining": str(restantes),
+        "X-RateLimit-Reset": str(recarga),
+    }
+
+
+def _descontar(
+    cubeta: CubetaDeTokens, consumidor: str, request: Request = None
+) -> str:
     permitido, espera = cubeta.consumir(consumidor)
     if not permitido:
         limite = cubeta.por_minuto_de(consumidor)
@@ -247,21 +298,34 @@ def _descontar(cubeta: CubetaDeTokens, consumidor: str) -> str:
         raise HTTPException(
             status_code=429,
             detail=f"Límite de {limite} consultas por minuto alcanzado",
-            headers={"Retry-After": str(max(1, round(espera)))},
+            headers={
+                "Retry-After": str(max(1, round(espera))),
+                **headers_de_limite(cubeta, consumidor),
+            },
         )
+    # Se dejan en el request y los copia el middleware de main.py, no acá: un
+    # Response construido a mano —el streaming de analíticas, y el que arma
+    # FastAPI para cada HTTPException— reemplaza al inyectado y se los comería.
+    # request es None cuando se llama fuera de un request (los tests).
+    if request is not None:
+        request.state.headers_de_limite = headers_de_limite(cubeta, consumidor)
     return consumidor
 
 
-def limitar_tasa(consumidor: str = Depends(verificar_api_key)) -> str:
+def limitar_tasa(
+    consumidor: str = Depends(verificar_api_key), request: Request = None
+) -> str:
     """Valida la clave y descuenta un token. Devuelve el nombre del consumidor."""
-    return _descontar(_limite, consumidor)
+    return _descontar(_limite, consumidor, request)
 
 
-def limitar_tasa_interna(consumidor: str = Depends(verificar_api_key_interna)) -> str:
+def limitar_tasa_interna(
+    consumidor: str = Depends(verificar_api_key_interna), request: Request = None
+) -> str:
     """Alcance interno + cuota propia, para precinto y analiticas.
 
     Es lo que evita que un uso interno pesado —no hace falta que sea malicioso,
     alcanza con un tablero refrescando— le coma a /cortes las conexiones de
     zabbix que comparten.
     """
-    return _descontar(_limite_interno, consumidor)
+    return _descontar(_limite_interno, consumidor, request)

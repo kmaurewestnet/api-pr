@@ -23,6 +23,13 @@ router = APIRouter(
 
 ESTADOS = svc.CATEGORIAS
 
+# El 501 avisa que el despliegue está incompleto, sin decir qué le falta: la
+# ruta del archivo y el nombre de la constante son estructura interna. El
+# detalle completo va al log, que es donde lo lee quien despliega.
+ENDPOINT_NO_CONFIGURADO = (
+    "Endpoint no disponible en este despliegue. Revisá el log del servidor."
+)
+
 
 def _filtrar(dispositivos, estado):
     """Filtra por categoría, la misma taxonomía excluyente que usa el resumen."""
@@ -103,15 +110,15 @@ def _stream(metadata, resumen, dispositivos):
             "Error al procesar las analíticas de la empresa",
         ),
         501: error(
-            "Faltan definir consultas SQL en `queries/analytics.py`. Constituye "
-            "un error de despliegue, no del request.",
-            "Faltan definir las consultas SQL en queries/analytics.py: "
-            "Q_NAPEAR_ONTS_POR_EMPRESA",
+            "El despliegue no tiene definidas todas las consultas SQL que el "
+            "endpoint necesita. Constituye un error de despliegue, no del "
+            "request: qué falta queda en el log del servidor.",
+            ENDPOINT_NO_CONFIGURADO,
         ),
         503: error(
             "Alguna de las tres bases involucradas (reservas, inventario de red o "
             "monitoreo de fibra) no responde. `/health` identifica cuál.",
-            "La base napear no está disponible",
+            db.SERVICIO_NO_DISPONIBLE,
         ),
     },
 )
@@ -209,10 +216,10 @@ def analiticas_empresa(
     try:
         metadata, resumen, dispositivos = svc.analitica_empresa(empresa_id, horas)
     except svc.QueriesNoConfiguradas as e:
-        log.error(str(e))
-        raise HTTPException(status_code=501, detail=str(e))
+        log.error("Empresa %s: %s", empresa_id, e)
+        raise HTTPException(status_code=501, detail=ENDPOINT_NO_CONFIGURADO)
     except db.DatabaseUnavailable as e:
-        log.error("Base no disponible: %s", e)
+        log.error("Empresa %s: base '%s' no disponible", empresa_id, e.nombre)
         raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         log.exception("Error en las analíticas de la empresa %s: %s", empresa_id, e)

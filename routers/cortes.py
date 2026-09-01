@@ -79,7 +79,7 @@ def cerrar_ejecutor() -> None:
             "a la tecnología del cliente, no responde. Sin ese dato la respuesta "
             "carecería de respaldo, por lo que se rechaza el request en lugar de "
             "devolver booleanos no verificados.",
-            "La base gestion no está disponible",
+            db.SERVICIO_NO_DISPONIBLE,
         ),
         504: error(
             f"La detección superó los {config.CORTES_TIMEOUT_SEG}s "
@@ -197,7 +197,12 @@ async def detectar_corte(
             ),
         )
     except db.DatabaseUnavailable as e:
-        log.error("Cliente %s (consumidor=%s): %s", numero_cliente, consumidor, e)
+        # La base va al log, no a la respuesta: el 503 dice que no se pudo, no
+        # qué pieza de la infraestructura se cayó.
+        log.error(
+            "Cliente %s (consumidor=%s): base '%s' no disponible",
+            numero_cliente, consumidor, e.nombre,
+        )
         raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         log.exception(

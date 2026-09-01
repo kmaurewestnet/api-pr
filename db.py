@@ -28,8 +28,27 @@ _lock = threading.Lock()
 _pools: dict = {}
 
 
+# El cuerpo del 503, igual para las cinco bases y para el pool agotado. Que
+# falle napear, gestion o el pool no le incumbe a quien consume la API: es
+# topología interna, y a `/cortes` llegan claves externas. Cuál falló se
+# responde en `/health` y se registra en el log, que es donde sirve.
+SERVICIO_NO_DISPONIBLE = (
+    "Servicio temporalmente no disponible. Reintentá en unos minutos."
+)
+
+
 class DatabaseUnavailable(RuntimeError):
-    """No se pudo crear el pool o conectar a la base indicada."""
+    """No se pudo crear el pool o conectar a la base indicada.
+
+    `str(e)` es lo que sale por el cuerpo del 503, así que es un texto fijo que
+    no nombra nada interno. El nombre de la base viaja aparte, en `.nombre`,
+    para las líneas de log: quien opera necesita saber cuál se cayó, quien
+    consume no.
+    """
+
+    def __init__(self, nombre: str, mensaje: str = None):
+        self.nombre = nombre
+        super().__init__(mensaje or SERVICIO_NO_DISPONIBLE)
 
 
 # --- Creación de pools ---
@@ -82,9 +101,7 @@ def _pool(nombre: str):
                 log.info("Pool de %s inicializado", nombre)
             except Exception as e:
                 log.error("No se pudo inicializar el pool de %s: %s", nombre, e)
-                raise DatabaseUnavailable(
-                    f"Base de datos '{nombre}' no disponible: {e}"
-                ) from e
+                raise DatabaseUnavailable(nombre) from e
         return _pools[nombre]
 
 
@@ -108,9 +125,7 @@ def _conexion_pg(nombre: str):
         conn = pool.getconn()
     except psycopg2.pool.PoolError as e:
         log.error("Pool de %s agotado (POOL_MAX=%s): %s", nombre, config.POOL_MAX, e)
-        raise PoolAgotado(
-            f"Sin conexiones libres a '{nombre}' (POOL_MAX={config.POOL_MAX})"
-        ) from e
+        raise PoolAgotado(nombre) from e
     try:
         yield conn
     finally:
@@ -154,9 +169,7 @@ def _conexion_mysql(nombre: str):
         conn = pool.get_connection()
     except PoolError as e:
         log.error("Pool de %s agotado (POOL_MAX=%s): %s", nombre, config.POOL_MAX, e)
-        raise PoolAgotado(
-            f"Sin conexiones libres a '{nombre}' (POOL_MAX={config.POOL_MAX})"
-        ) from e
+        raise PoolAgotado(nombre) from e
     try:
         yield conn
     finally:

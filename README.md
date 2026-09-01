@@ -9,6 +9,12 @@ API HTTP de consulta sobre ONUs y clientes:
 | `GET /api/v1/cortes/{numero_cliente}` | Si un cliente está caído y si el corte es de zona | gestion + zabbix + zabbix_wireless + soldef |
 | `GET /health` | Conectividad de cada base y de las utilidades del sistema | las 5 |
 
+Los cuerpos de error no nombran infraestructura: un `503` responde siempre el
+mismo texto, sin decir qué base se cayó, y `/health` le da el detalle por base
+solo a las claves internas. Cuál falló queda en el log del servidor. Enumerar
+las cinco bases y devolver el mensaje del driver —que trae host, puerto y
+usuario— es entregar el mapa, y a `/cortes` y `/health` llegan claves externas.
+
 Todos requieren la cabecera `X-API-Key`.
 
 ## Puesta en marcha
@@ -351,7 +357,14 @@ sin atender a la centralita.
 a un consumidor puntual, sobre la cuota general. Los endpoints internos no se
 ajustan por consumidor: ahí solo llegan claves internas.
 
-Devuelve `429` con `Retry-After`. Importa más que en una API común por la
+Devuelve `429` con `Retry-After`, y **toda** respuesta con cuota lleva
+`X-RateLimit-Limit`, `-Remaining` y `-Reset` (epoch del próximo token). Van
+también en los errores: los pone un middleware sobre la respuesta ya armada,
+porque un `Response` construido a mano —el streaming de `full=true`, o el que
+FastAPI arma para cada `HTTPException`— reemplaza al que inyecta la dependencia y
+se comería los headers. Con la cuota en `0` se omiten los tres.
+
+Importa más que en una API común por la
 amplificación: **un request puede disparar decenas de consultas SNMP contra una
 OLT de producción**, así que un loop sobre números de cliente le hace DoS a la
 red, no a la API.

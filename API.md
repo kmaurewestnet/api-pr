@@ -10,7 +10,7 @@ y rendimiento están en [README.md](README.md).
 | `GET /api/v1/precinto/{codigo}` | Series históricas de **una** ONU: RX, OLT RX, logs, estados |
 | `GET /api/v1/empresa/{id}/analytics` | Estado del **parque completo** de una empresa |
 | `GET /api/v1/cortes/{numero_cliente}` | Si **un cliente** está caído y si el corte es de zona |
-| `GET /health` | Conectividad de las 5 bases y de `ping` / `snmpget` |
+| `GET /health` | Estado del servicio. Con clave interna, además el detalle por base y por utilidad |
 
 Todos requieren el header `X-API-Key`. Cada consumidor tiene la suya: el nombre
 aparece en el log de cada request y es la unidad del rate limit, así que se le
@@ -60,7 +60,7 @@ La combinación que importa para atención al cliente:
 | `429` | Rate limit del consumidor alcanzado. Trae `Retry-After` en segundos |
 | `504` | La detección superó `CORTES_TIMEOUT_SEG` (25 s) |
 | `404` | El cliente no existe o no tiene contrato activo en las categorías contempladas |
-| `503` | Gestión o el Zabbix de la tecnología correspondiente no responden |
+| `503` | Una dependencia no responde. El cuerpo es genérico y no identifica cuál: eso se consulta en `/health` con una clave interna |
 | `500` | Error inesperado |
 
 Una verificación suelta que falle (un ping, un `snmpget`, una consulta de estado)
@@ -245,4 +245,4 @@ ONU, sea de hoy o de hace tres meses. Los campos `*_timestamp` te dejan juzgarlo
 | `404` | La empresa no tiene dispositivos en napear |
 | `422` | Parámetro fuera de rango o `estado` inválido |
 | `500` | Error al procesar |
-| `503` | Alguna base de datos no responde — `/health` dice cuál |
+| `503` | Una dependencia no responde. El cuerpo es genérico; `/health` con clave interna dice cuál |
