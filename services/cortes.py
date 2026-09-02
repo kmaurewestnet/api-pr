@@ -41,7 +41,7 @@ import db
 from queries import cortes as q
 from services import red
 from services.cortes_io import (  # noqa: F401
-    FuenteReal, _en_paralelo, _regex_ip, _topologia,
+    FuenteReal, _en_paralelo, _topologia,
 )
 from services.cortes_reglas import (  # noqa: F401
     TABLA_SNMP,

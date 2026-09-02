@@ -238,11 +238,6 @@ def test_ip_valida_es_frontera_de_confianza():
         assert red.ip_valida(basura) == ""
 
 
-def test_regex_ip_escapa_los_puntos():
-    # Sin escapar, 10.1.1.1 como patrón matchearía 10X1Y1Z1.
-    assert svc._regex_ip("10.1.1.1") == r"10\.1\.1\.1"
-
-
 def _consultas():
     return {n: v for n, v in vars(q).items()
             if n.startswith("Q_") and isinstance(v, str)}
@@ -285,8 +280,10 @@ def test_parametros_con_frontera_en_regex():
 
     Sin frontera el match es de subcadena, y devuelve el aparato de otro cliente:
     8870 da positivo contra los items del 88704, y 10.1.1.1 contra los del
-    110.1.1.10. Las dos formas estuvieron en el código; la del cliente se arregló
-    al portar el documento, la de la IP quedó abierta hasta que se midió.
+    110.1.1.10. Las dos formas estuvieron en el código. La del cliente se arregló
+    poniéndole frontera al regex; la de la IP se resolvió mejor, sacando el regex
+    —el AP entra por igualdad de `key_`— así que hoy esto cubre el camino de
+    fibra, que es el único que sigue matcheando por patrón.
 
     Se chequea la forma del SQL y no el resultado porque el regex lo evalúa
     Postgres. Lo que puede volver a romperse acá es que alguien saque la frontera

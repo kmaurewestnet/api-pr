@@ -126,12 +126,6 @@ def _pg(conexion, sql, params):
     return _pg_multi(conexion, [(sql, params)])[0]
 
 
-def _regex_ip(ip: str) -> str:
-    """La IP se usa como patrón `~*` contra items.name. Los puntos se escapan
-    para que 10.1.1.1 no matchee 10X1Y1Z1."""
-    return ip.replace(".", r"\.")
-
-
 # --- SNMP ---------------------------------------------------------------------
 
 def _valores_snmp(olt_ip: str, oids: list) -> dict:
@@ -234,7 +228,7 @@ class FuenteReal:
             return {"ap_ip": "", "ap": None, "rb_ip": "", "rb": None}
 
         rb_ip = ip_routerboard(ip)
-        filas_ap = _pg(db.zabbix_wireless_conn, q.Q_ZBX_WIFI_AP, (_regex_ip(ip),))
+        filas_ap = _pg(db.zabbix_wireless_conn, q.Q_ZBX_WIFI_AP, (ip,))
         filas_rb = (
             _pg(db.zabbix_wireless_conn, q.Q_ZBX_WIFI_RB, (rb_ip,)) if rb_ip else []
         )

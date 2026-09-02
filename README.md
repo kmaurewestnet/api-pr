@@ -609,6 +609,30 @@ sigue costando escrituras y no usa nadie:
 SELECT indexrelid::regclass, indisvalid FROM pg_index WHERE NOT indisvalid;
 ```
 
+### En `zabbix_wireless`: ninguno, y es un resultado
+
+Esa instancia tiene un `items` casi del mismo tamaño (472.533 filas, 310 MB) y
+`Q_ZBX_WIFI_AP` sufría lo mismo: **253 ms barriendo la tabla entera**, 18.887
+buffers, porque buscaba el AP con `i.name ~* <ip>`.
+
+No se resolvió con un índice sino sacando el regex. LLD arma la key y el nombre
+desde la misma macro —`ubntCPEmac[{#IPADDR}]` y `{#IPADDR}: MAC`—, así que la IP
+ya está en la key y alcanza con comparar por igualdad:
+
+```sql
+WHERE i.key_ = ('ubntCPEmac[' || %s || ']')
+```
+
+Entra por `items_8 (key_)`, que ya existe. Sin índice nuevo, sin `pg_trgm`, sin
+depender de la collation, y con el regex se va la clase de bug del match por
+subcadena. La equivalencia está verificada sobre los 19.454 items reales
+(`flags = 4`): en todos, `name = ip || ': MAC'` con la ip de su propia key. Los
+2.172 restantes son prototipos con el `{#IPADDR}` sin resolver, que no
+matcheaban por ninguna de las dos vías.
+
+`Q_ZBX_WIFI_RB` ya costaba 0,196 ms —entra por `interface_2` sobre `ip`— y no se
+tocó.
+
 ### Lo que se evaluó y no hizo falta
 
 Una **vista materializada** con la topología ya extraída, en un schema `api`

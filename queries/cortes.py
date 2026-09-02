@@ -17,11 +17,16 @@ Cuatro cambios respecto del documento, todos deliberados:
    estado de NAP, y después comparaba una contra la otra: cualquier NAP cuyo
    nombre incluyera '-AP', 'au', '1084M' o '288e' se extraía distinto en cada
    lado y el estado nunca podía matchear. Se usa la larga en ambos lados.
-4. `Q_ZBX_WIFI_AP` compara la IP con frontera y no como subcadena. El documento
-   escapaba los puntos pero dejaba el match suelto, así que 10.1.1.1 daba
-   positivo dentro de 110.1.1.10 y devolvía el AP de otro nodo. Es el mismo bug
-   que el `~* '$code'` pelado del camino Solar, corregido acá en su momento y
-   que del lado wireless había quedado abierto.
+4. `Q_ZBX_WIFI_AP` busca el AP por igualdad de `key_` y no con un `~*` contra
+   `items.name`. El documento matcheaba el nombre como subcadena, así que
+   10.1.1.1 daba positivo dentro de 110.1.1.10 y devolvía el AP de otro nodo
+   —el mismo bug que el `~* '$code'` pelado del camino Solar—. Se corrigió
+   primero poniéndole frontera al regex; después, al medir, resultó que la IP
+   ya está en la key (`ubntCPEmac[10.0.10.26]`, con el nombre derivado de la
+   misma macro: `10.0.10.26: MAC`), así que el regex sobra. Verificado sobre
+   los 19.454 items reales: en todos, `name = ip || ': MAC'` con la ip de su
+   propia key. La igualdad entra por el índice `items_8` y evita el escaneo
+   de las 472.533 filas que costaba 253 ms.
 
 Todos los identificadores de cliente que entran a un `~*` vienen validados como
 dígitos (ver routers/cortes.py), así que no pueden aportar metacaracteres de
@@ -275,21 +280,25 @@ WHERE b.nap = ({_nap_normalizada('n.nap_extraida')})
 # Params  : (ip_cliente_escapada_como_regex,)
 # Columnas: host, ip
 #
-# La IP va con frontera, igual que el número de cliente en `_MATCH_CODE`. Sin
-# ella el `~*` matchea como subcadena: los puntos están escapados, pero nada
-# impide que 10.1.1.1 dé positivo adentro de 110.1.1.10 y se devuelva el AP de
-# otro nodo.
+# Por igualdad de `key_` y no por regex contra `items.name`: LLD arma las dos
+# cosas desde la misma macro, la key como `ubntCPEmac[{#IPADDR}]` y el nombre
+# como `{#IPADDR}: MAC`. La IP ya está en la key, así que el regex sobraba.
 #
-# La clase excluye el punto además del dígito. Si solo excluyera dígitos,
-# 10.1.1.1 seguiría matcheando dentro de 1.10.1.1.1: la frontera tiene que
-# cortar el número dotted completo, no cada octeto.
+# No es solo performance —de 253 ms escaneando las 472.533 filas de items a un
+# lookup por `items_8`—: sin regex desaparece la clase de bug entera. El match
+# contra el nombre era de subcadena, y 10.1.1.1 daba positivo dentro de
+# 110.1.1.10, devolviendo el AP de otro nodo.
+#
+# La equivalencia está verificada sobre los 19.454 items reales (flags=4): en
+# todos, `name = ip || ': MAC'` con la ip de su propia key. Los 2.172 restantes
+# son prototipos con el `{#IPADDR}` sin resolver, que no matcheaban por ninguna
+# de las dos vías.
 Q_ZBX_WIFI_AP = """
 SELECT DISTINCT h.host, intf.ip
 FROM items i
 LEFT JOIN hosts h ON i.hostid = h.hostid
 LEFT JOIN interface intf ON h.hostid = intf.hostid AND intf.main = 1
-WHERE i.key_ ~* 'ubntCPEmac'
-  AND i.name ~* ('(^|[^0-9.])' || %s || '([^0-9.]|$)')
+WHERE i.key_ = ('ubntCPEmac[' || %s || ']')
 """
 
 # Params  : (ip_del_routerboard,)
