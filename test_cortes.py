@@ -280,6 +280,24 @@ def test_cantidad_de_parametros():
         assert real == cantidad, f"{nombre}: {real} placeholders, se esperaban {cantidad}"
 
 
+def test_parametros_con_frontera_en_regex():
+    """Ningún `%s` entra pelado a un `~*`: siempre con frontera alrededor.
+
+    Sin frontera el match es de subcadena, y devuelve el aparato de otro cliente:
+    8870 da positivo contra los items del 88704, y 10.1.1.1 contra los del
+    110.1.1.10. Las dos formas estuvieron en el código; la del cliente se arregló
+    al portar el documento, la de la IP quedó abierta hasta que se midió.
+
+    Se chequea la forma del SQL y no el resultado porque el regex lo evalúa
+    Postgres. Lo que puede volver a romperse acá es que alguien saque la frontera
+    editando la consulta, y eso sí se ve desde este lado.
+    """
+    for nombre, sql in _consultas().items():
+        assert not re.search(r"~\*?\s*%s", sql), (
+            f"{nombre} matchea %s como subcadena: le falta la frontera"
+        )
+
+
 def _snmpget_falso(tmp):
     """snmpget de mentira: imprime '<oid> 2' por cada OID que recibe, en el mismo
     formato que `snmpget -Oqn`."""

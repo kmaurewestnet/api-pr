@@ -529,20 +529,99 @@ en que MySQL devolviera las filas, que no está garantizado.
 
 ## Índices que espera esta API en Zabbix
 
-Las tres consultas del camino FTTH filtran `items` por `key_`. Sin índice, cada
-una recorre las ~156.000 filas de la tabla: medido, 616 ms de los 645 ms de la
-consulta de estado de ONT.
+`items` tiene **474.798 filas y 663 MB**. Sin índices propios, las tres consultas
+del camino FTTH la barren entera —158.150 filas descartadas por worker, con 3
+workers— y se llevan unos 270 MB de tráfico sobre `shared_buffers` cada una: la
+API le desaloja a Zabbix su propio working set. Medido, antes y después:
+
+| Consulta | Sin índices | Con índices | Buffers |
+|---|---|---|---|
+| `Q_ZBX_ESTADO_NAP` | 234 ms | **8,5 ms** | 35.595 → 2.247 |
+| `Q_ZBX_TOPOLOGIA_FTTH` | 332 ms | **0,7 ms** | 33.437 → 24 |
+| `Q_ZBX_ESTADO_CLIENTE` | 394 ms | **2,6 ms** | 33.699 → cientos |
+
+Lo selectivo no es la `key_`: los items de LOS y OnlineState son una fracción
+grande de las 474k, así que el planner prefiere barrer antes que ir por índice.
+Lo selectivo es **la NAP y el número de cliente**, y cada uno necesita su índice
+porque entran distinto: uno por igualdad, el otro por un regex armado con el
+parámetro.
 
 ```sql
-CREATE INDEX CONCURRENTLY IF NOT EXISTS items_key_pattern_idx
-    ON items (key_ varchar_pattern_ops);
+-- El que ya estaba: sirve al `LIKE` anclado de las keys.
+CREATE INDEX CONCURRENTLY IF NOT EXISTS items_key__status_name_idx
+    ON items (key_, status, name);
+
+-- La NAP, por igualdad. La expresión es `_NAP_EXTRAIDA` de queries/cortes.py,
+-- textual y sin el alias `i.`. No lleva `WHERE status = 0`: la topología FTTH y
+-- las dos consultas de OIDs Solar no filtran por status, y un índice parcial no
+-- las serviría.
+CREATE INDEX CONCURRENTLY IF NOT EXISTS items_nap_extraida_idx
+    ON items ((<_NAP_EXTRAIDA>));
+
+-- El número de cliente, por regex. `_MATCH_CODE` arma el patrón con el
+-- parámetro adentro, así que ningún b-tree sirve: van trigramas.
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE INDEX CONCURRENTLY IF NOT EXISTS items_codigo_trgm_idx
+    ON items USING gin (split_part(name, '_zone', 1) gin_trgm_ops)
+    WHERE key_ LIKE 'hwGponDeviceOntAlarmLOSi%'
+       OR key_ LIKE 'hwGponDeviceOntEthernetOnlineState%'
+       OR key_ ~* 'rx.ont'
+    WITH (fastupdate = off);
+
 ANALYZE items;
 ```
 
-`varchar_pattern_ops` es lo que hace que `LIKE 'patrón%'` pueda usar el índice
-cuando la base no está en collation C. `CONCURRENTLY` para no bloquear `items`
-en un Zabbix vivo; la tabla casi no se escribe (solo al provisionar o descubrir),
-así que mantenerlo es despreciable.
+**El `WHERE` del trigram no es cosmético.** `split_part(name,'_zone',1)` sobre un
+item que no es una ONT devuelve el nombre entero, así que sin el parcial se
+indexarían los nombres completos de las 474k filas. Con él: **48 MB**. Los
+predicados de `key_` de las consultas implican ese `OR`, y el planner lo prueba;
+si alguna vez deja de usarlo, sacale el `WHERE` y pagá el tamaño.
+
+`fastupdate = off` porque `items` recibe ~143 escrituras por hora: la *pending
+list* no ahorra nada y cada consulta tendría que escanearla igual.
+
+**El costo de escritura es despreciable, y está medido.** LLD corre cada hora
+pero descarga su contabilidad en `item_discovery` —411.700 updates/hora— y toca
+`items` solo cuando algo cambia de verdad: 96 updates, 32 inserts y 15 deletes
+por hora, un factor 4.276 de diferencia. Además `items` ya tenía
+`n_tup_hot_upd = 0`: todo update ya rompía HOT y ya mantenía 12 índices, así que
+pasar a 14 es un +17 % sobre 96 updates/hora.
+
+### Antes de un upgrade de Zabbix
+
+Los dos índices nuevos son **objetos propios dentro del esquema de Zabbix** y
+dependen de la columna `items.name`. Una migración que la altere puede fallar por
+esa dependencia, y el upgrade tarda más con dos índices extra que reconstruir.
+
+```sql
+-- Antes del upgrade
+DROP INDEX CONCURRENTLY IF EXISTS items_nap_extraida_idx;
+DROP INDEX CONCURRENTLY IF EXISTS items_codigo_trgm_idx;
+-- Después, recrear con el bloque de arriba y correr ANALYZE items.
+```
+
+`CONCURRENTLY` no puede correr dentro de una transacción y espera a que terminen
+todas las transacciones anteriores —el housekeeper de Zabbix tiene largas—, así
+que puede quedarse esperando un rato. Si falla, deja un índice **inválido** que
+sigue costando escrituras y no usa nadie:
+
+```sql
+SELECT indexrelid::regclass, indisvalid FROM pg_index WHERE NOT indisvalid;
+```
+
+### Lo que se evaluó y no hizo falta
+
+Una **vista materializada** con la topología ya extraída, en un schema `api`
+aparte, para no tocar `items`. Resolvía el mismo regex convirtiéndolo en `@>`
+sobre un array de códigos, pero a cambio de un refresco periódico, staleness y un
+job que operar. El trigram lo resolvió sin nada de eso.
+
+Una **cota temporal sobre `history_str`** (`AND h.clock > ahora - ventana`) para
+que TimescaleDB pueda excluir chunks: es lo que explica los ~42 ms de
+`Planning Time` que quedan. Se descartó a propósito: `history_str` guarda eventos
+de LOS, y la última entrada de un cliente puede ser de hace días y seguir siendo
+su estado vigente. Se prefiere buscar el último valor disponible sin ventana
+antes que arriesgar que el estado desaparezca y el corte deje de verse.
 
 **Las consultas usan `LIKE` anclado, que es sensible a mayúsculas**, a diferencia
 del `~*` del documento original. Eso es lo que permite el índice. Si alguna vez

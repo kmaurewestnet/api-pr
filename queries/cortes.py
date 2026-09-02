@@ -4,7 +4,7 @@ Todas las consultas de `documentacion_api_cortes_v1.md` se pasaron a parámetros
 bind (`%s`): el documento original interpolaba `$code`, `$ip`, `$oltip` y `$nap`
 directamente en el string, que es inyección SQL servida.
 
-Tres cambios respecto del documento, todos deliberados:
+Cuatro cambios respecto del documento, todos deliberados:
 
 1. `$__unixEpochGroupAlias(h.clock,'1m')` es una macro de Grafana, no SQL. Se
    reemplazó por `floor(h.clock/60)*60 AS time`, que es su expansión y la misma
@@ -17,6 +17,11 @@ Tres cambios respecto del documento, todos deliberados:
    estado de NAP, y después comparaba una contra la otra: cualquier NAP cuyo
    nombre incluyera '-AP', 'au', '1084M' o '288e' se extraía distinto en cada
    lado y el estado nunca podía matchear. Se usa la larga en ambos lados.
+4. `Q_ZBX_WIFI_AP` compara la IP con frontera y no como subcadena. El documento
+   escapaba los puntos pero dejaba el match suelto, así que 10.1.1.1 daba
+   positivo dentro de 110.1.1.10 y devolvía el AP de otro nodo. Es el mismo bug
+   que el `~* '$code'` pelado del camino Solar, corregido acá en su momento y
+   que del lado wireless había quedado abierto.
 
 Todos los identificadores de cliente que entran a un `~*` vienen validados como
 dígitos (ver routers/cortes.py), así que no pueden aportar metacaracteres de
@@ -269,13 +274,22 @@ WHERE b.nap = ({_nap_normalizada('n.nap_extraida')})
 # --- Paso 2B/3B: topología wireless (Zabbix Wireless) -------------------------
 # Params  : (ip_cliente_escapada_como_regex,)
 # Columnas: host, ip
+#
+# La IP va con frontera, igual que el número de cliente en `_MATCH_CODE`. Sin
+# ella el `~*` matchea como subcadena: los puntos están escapados, pero nada
+# impide que 10.1.1.1 dé positivo adentro de 110.1.1.10 y se devuelva el AP de
+# otro nodo.
+#
+# La clase excluye el punto además del dígito. Si solo excluyera dígitos,
+# 10.1.1.1 seguiría matcheando dentro de 1.10.1.1.1: la frontera tiene que
+# cortar el número dotted completo, no cada octeto.
 Q_ZBX_WIFI_AP = """
 SELECT DISTINCT h.host, intf.ip
 FROM items i
 LEFT JOIN hosts h ON i.hostid = h.hostid
 LEFT JOIN interface intf ON h.hostid = intf.hostid AND intf.main = 1
 WHERE i.key_ ~* 'ubntCPEmac'
-  AND i.name ~* %s
+  AND i.name ~* ('(^|[^0-9.])' || %s || '([^0-9.]|$)')
 """
 
 # Params  : (ip_del_routerboard,)
