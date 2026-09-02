@@ -250,8 +250,21 @@ Dos límites que definen cuántas consultas simultáneas aguanta:
 | Conexiones a `zabbix` en paralelo | **1** | Los 4 lookups del camino Solar (OIDs de LOS, de OnlineState, de la NAP y ocupación) van sobre una sola conexión en `_pg_multi`. Entran por índice sobre `items`: secuenciarlos cuesta milisegundos frente a los segundos de un ping |
 | Subprocesos `snmpget` para una NAP de 64 | **4** | `snmpget` acepta varios OIDs en el mismo PDU (`SNMP_OIDS_POR_CONSULTA`, default 20) |
 
-Con `POOL_MAX=10` eso da ~10 requests concurrentes antes de tocar el techo del
-pool. Y cuando lo toca, **falla en vez de mentir**: `db.PoolAgotado` es la única
+Los tres endpoints tienen tope de admisión, así que la demanda máxima sobre el
+pool de zabbix es un número nuestro y no el que salga: `cortes 5x2 + analytics
+2x2 + precinto 2x1 = 16`, y `POOL_MAX` está en 16. `main.revisar_presupuesto_zabbix`
+hace esa suma al arrancar y avisa por log si no cierra.
+
+Hasta que `/precinto` y `/analytics` tuvieron el suyo, a esos dos los acotaba el
+threadpool de FastAPI —40 hilos, un default que nadie eligió para esta API— y
+entre los dos podían pedir más de 100 conexiones. El semáforo de `admision.py` es
+de `asyncio` y su dependencia es `async def` a propósito: FastAPI resuelve las
+dependencias asincrónicas en el event loop, así que **el que espera un lugar no
+ocupa un hilo**. Con `threading.Semaphore` la cola solo cambiaba de lugar.
+Vencido `INTERNO_ESPERA_SEG` sale por `503` —no `504`— porque el request todavía
+no empezó: no es que tardó, es que no había lugar.
+
+Cuando aun así se toca el techo, **falla en vez de mentir**: `db.PoolAgotado` es la única
 excepción que `_en_paralelo` no convierte en "no evaluable", porque quedarse sin
 conexiones no es "la red no contestó" sino "no llegué a preguntar". Sale por
 `503`. Todo lo demás sigue degradando a `200`.
@@ -321,6 +334,50 @@ indefinidamente. Cada vez que pasa, queda un `WARNING` con la edad del dato.
 
 Sin valor previo utilizable no hay nada que servir y la excepción se propaga:
 `PoolAgotado` sigue saliendo por 503.
+
+### Caché de la topología del cliente
+
+El otro caché, y el único que guarda algo **por cliente**. No contradice la regla
+del de zona —"lo per-cliente tiene que ser fresco"— porque no guarda estado:
+guarda de qué caja cuelga el cliente. Su tecnología e IP en Gestión, y su NAP y
+OLT (o su AP y RouterBoard) en Zabbix. Eso cambia al provisionarlo o mudarlo, no
+cuando se cae.
+
+No está para ahorrar consultas, que son baratas y entran por índice. Está porque
+esas dos son **las únicas consultas obligatorias del endpoint**: si fallan, sale
+`503`, porque sin ellas los tres booleanos serían inventados. Con una topología
+guardada, `/cortes` sigue respondiendo durante una caída de Gestión o de Zabbix.
+Medido contra la app real, con las dos bases caídas:
+
+```
+1. base sana           -> 200 {"isFtth": true, "isOnline": true, "isZoneIncident": false}
+2. gestion+zabbix down -> 200 {"isFtth": true, "isOnline": true, "isZoneIncident": false}
+   WARNING cache topologia: ('cliente', '302381') falló (DatabaseUnavailable('gestion')),
+           se sirve el valor de hace 1s
+3. cliente nunca visto -> 503
+```
+
+El tercer caso es el límite honesto: **el caché no vuelve inmune al endpoint,
+protege al que ya pasó por él.** Un cliente que nunca se consultó no tiene nada
+guardado. Durante un corte de zona eso alcanza, porque los que llaman son los
+mismos que ya llamaron.
+
+El `TTL` es corto (300 s) y el margen de valor vencido largo (3600 s): en
+operación normal la topología se relee, y el margen solo se usa cuando el
+recálculo falla. Pasado ese margen se deja de servir — una topología de horas ya
+no es un dato, es una suposición.
+
+Dos cosas que hubo que resolver:
+
+* **Se cachean las filas crudas de Gestión, no el cliente ya resuelto.** Así "sin
+  contrato activo" es un valor —una lista vacía— y no una excepción. Si
+  `ClienteNoEncontrado` entrara al caché por la vía del valor vencido, un cliente
+  dado de baja se seguiría resolviendo con su topología vieja durante toda la
+  ventana.
+* **La IP es el dato que puede envejecer mal.** Si la de un cliente cambia,
+  durante el TTL se pingea la anterior y `isOnline` sale mal. Con direcciones
+  fijas es irrelevante; si fueran dinámicas, hay que bajar
+  `CACHE_TOPOLOGIA_TTL_SEG` o ponerlo en 0.
 
 ### Consumidores, rate limit y deadline
 
@@ -535,12 +592,80 @@ dejar la conexión tomada. El log de cada request incluye el tiempo por paso:
 empresa=2 seriales=12345 onus=12000 precintos=11987 | napear=0.31s soldef=1.20s zabbix=2.44s total=4.02s
 ```
 
+## Despliegue en dos fleets
+
+La API es *stateless* y de solo lectura: su único estado es efímero y por proceso
+(la caché de zona y las cubetas del rate limit). Eso permite correr **la misma
+imagen dos veces** con perfiles distintos, y rutear por path, sin partir el
+código en servicios:
+
+```
+                     ┌── fleet critico   API_PERFIL=critico  POOL_MAX=10
+  proxy (por path) ──┤     /api/v1/cortes/*          2+ instancias
+                     └── fleet interno   API_PERFIL=interno  POOL_MAX=6
+                           /api/v1/precinto/*  /api/v1/empresa/*/analytics
+```
+
+`API_PERFIL` no es solo configuración del proxy: la instancia crítica **no monta**
+los routers internos, así que un request mal ruteado responde `404` en vez de
+llevarse dos conexiones de zabbix del pool que protege a `/cortes`. El
+presupuesto que se verifica al arrancar es el de esa instancia —la crítica no
+paga por analytics— así que cada fleet dimensiona su `POOL_MAX` por lo que
+realmente sirve. `/health` va en los tres perfiles, porque lo consulta el
+balanceador.
+
+Un `API_PERFIL` mal escrito **aborta el arranque** en vez de caer al default: un
+typo montaría todo en la instancia crítica y el aislamiento se perdería en
+silencio, que es justo lo que el perfil existe para evitar.
+
+```yaml
+# docker-compose.yml
+services:
+  critico:
+    image: api-pr
+    env_file: .env
+    environment: { API_PERFIL: critico, POOL_MAX: 10 }
+    deploy: { replicas: 2 }
+  interno:
+    image: api-pr
+    env_file: .env
+    environment: { API_PERFIL: interno, POOL_MAX: 6 }
+```
+
+```nginx
+# nginx: el path decide el fleet
+location /api/v1/cortes/            { proxy_pass http://critico; }
+location /api/v1/precinto/          { proxy_pass http://interno; }
+location ~ ^/api/v1/empresa/.+/analytics { proxy_pass http://interno; }
+```
+
+### Lo que hay que mirar al pasar a más de una instancia
+
+**El rate limit se multiplica.** Es en memoria y por proceso: con 2 instancias
+del fleet crítico, `RATE_LIMIT_POR_MINUTO=60` da 120/min efectivos. No es
+cosmético —el límite existe porque un request de `/cortes` puede disparar decenas
+de consultas SNMP contra una OLT de producción—, así que **hay que dividir el
+valor configurado por la cantidad de instancias** (60 → 30 con dos réplicas).
+Compartirlo de verdad requiere Redis, que es infraestructura nueva.
+
+**La caché de zona también es por proceso.** Con N instancias, la primera
+consulta de una NAP se calcula hasta N veces en vez de una. El single-flight
+sigue funcionando dentro de cada proceso, que es donde está el pico; el costo es
+un factor N sobre el piso, no sobre el pico.
+
+**`POOL_MAX` es por instancia.** Dos réplicas del fleet crítico con `POOL_MAX=10`
+son 20 conexiones contra Postgres, no 10. Es la cuenta que hay que hacer contra
+`max_connections`, y el argumento para PgBouncer cuando la cantidad de réplicas
+crezca.
+
+
 ## Estructura
 
 ```
 config.py             DSNs de las 5 bases, API key, logging, límites, red/SNMP
 db.py                 pools de conexión + context managers
 security.py           identidad del consumidor + rate limit
+admision.py           tope de requests simultáneos de precinto y analytics
 models.py             modelos de respuesta (documentan /docs)
 queries/precinto.py   las 4 consultas del endpoint de precinto
 queries/analytics.py  las 4 consultas del cruce entre bases
@@ -549,7 +674,7 @@ services/analytics.py orquestación de los 3 pasos, cruce y agregados
 services/cache.py     caché con TTL y single-flight del estado de zona
 services/red.py       ping ICMP y snmpget: subprocesos acotados y validados
 services/cortes.py    recorrido de topología y matriz de decisión de cortes
-routers/              un módulo por endpoint
+routers/              un módulo por endpoint (main.py monta los del perfil)
 test_cortes.py        chequeo de la matriz de decisión, sin framework
 ```
 

@@ -49,6 +49,21 @@ _zona = CacheTTL(
 )
 
 
+# Topología del cliente: de qué caja cuelga. Es lo único por cliente que se
+# cachea, y se cachea porque no es estado: cambia al provisionar o mudar, no
+# cuando hay un corte. Ver el comentario de CACHE_TOPOLOGIA_TTL_SEG en config.
+#
+# Su razón de ser es el valor vencido, no el hit: estas consultas son las
+# obligatorias del endpoint, y sin ellas la respuesta es 503. Con una topología
+# de hace un rato, /cortes sigue contestando aunque Gestión o Zabbix no estén.
+_topologia = CacheTTL(
+    config.CACHE_TOPOLOGIA_TTL_SEG,
+    config.CACHE_TOPOLOGIA_MAX_ENTRADAS,
+    nombre="topologia",
+    stale_max_seg=config.CACHE_TOPOLOGIA_STALE_MAX_SEG,
+)
+
+
 # --- Ejecución concurrente ----------------------------------------------------
 
 def _en_paralelo(tareas: dict) -> dict:
@@ -161,17 +176,25 @@ def _interpretar(oids, valores, interprete, metrica, olt_ip) -> list:
 class FuenteReal:
     """Las nueve señales que puede pedir la evaluación de un corte.
 
-    Las que llevan caché lo dicen en el nombre: `ping_zona` es infraestructura
-    compartida por la caja, `ping_cliente` es la respuesta puntual de un cliente
-    y tiene que ser fresca siempre.
+    Hay dos cachés y cachean cosas distintas:
 
-    El caché entra por parámetro y no se lee del global: en producción es el
+    * `_zona` — lo que comparten todos los clientes de una caja: `ping_zona` y
+      `estado_nap`. `ping_cliente` y `estado_ont` NO entran: son la respuesta
+      puntual de un cliente y tienen que ser frescas siempre.
+    * `_topologia` — de qué caja cuelga cada cliente. Es por cliente, pero no es
+      estado: cambia al provisionarlo o mudarlo, no cuando se cae. Está para que
+      una caída de Zabbix no deje al endpoint sin la consulta obligatoria.
+
+    Los cachés entran por parámetro y no se leen del global: en producción son el
     singleton compartido por todos los requests, y una prueba construye el suyo
     sin ensuciarlo.
     """
 
-    def __init__(self, cache=None):
+    def __init__(self, cache=None, cache_topologia=None):
         self._cache = cache if cache is not None else _zona
+        self._topologia = (
+            cache_topologia if cache_topologia is not None else _topologia
+        )
 
     # --- Pings ---
 
@@ -184,6 +207,11 @@ class FuenteReal:
     # --- Topología ---
 
     def topologia_ftth(self, nro_cliente: str) -> dict:
+        return self._topologia.obtener(
+            ("ftth", nro_cliente), partial(self._topologia_ftth, nro_cliente)
+        )
+
+    def _topologia_ftth(self, nro_cliente: str) -> dict:
         filas = _pg(db.zabbix_conn, q.Q_ZBX_TOPOLOGIA_FTTH, (nro_cliente,))
         if not filas:
             return {"nap": None, "olt_nombre": None, "olt_ip": ""}
@@ -195,6 +223,11 @@ class FuenteReal:
         }
 
     def topologia_wireless(self, ip: str) -> dict:
+        return self._topologia.obtener(
+            ("wireless", ip), partial(self._topologia_wireless, ip)
+        )
+
+    def _topologia_wireless(self, ip: str) -> dict:
         """AP y RouterBoard del cliente. Sin IP no se consulta: `i.name ~* ''`
         matchearía todos los items del Zabbix."""
         if not ip:

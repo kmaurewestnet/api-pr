@@ -47,6 +47,29 @@ def _int(nombre: str, default: int) -> int:
 API_KEY_NAME = "X-API-Key"
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
 
+# Qué endpoints monta ESTA instancia. La misma imagen se despliega dos veces con
+# perfiles distintos y un proxy rutea por path, para que los tableros y la
+# atención al cliente no compartan proceso ni pool de conexiones:
+#
+#   critico   /cortes            consumido por la app móvil, la centralita y el
+#                                chatbot. Es el que tiene objetivo de 99%.
+#   interno   /precinto /analytics   tableros. Mejor que estén, pero no críticos.
+#   completo  todos              default: una sola instancia, como hasta ahora.
+#
+# No es solo configuración del proxy: la instancia crítica directamente no monta
+# los endpoints internos, así que un request mal ruteado responde 404 en vez de
+# llevarse dos conexiones de zabbix del pool que protege a /cortes. `/health` va
+# en los tres, porque lo consulta el balanceador.
+PERFILES = ("completo", "critico", "interno")
+API_PERFIL = os.getenv("API_PERFIL", "completo").strip().lower()
+if API_PERFIL not in PERFILES:
+    # Falla al arrancar y no cae al default: un perfil mal escrito montaría todo
+    # en la instancia crítica y el aislamiento se perdería en silencio, que es
+    # justo lo que este perfil existe para evitar.
+    raise ConfigError(
+        f"API_PERFIL='{API_PERFIL}' no es válido. Opciones: {', '.join(PERFILES)}"
+    )
+
 # Una clave por consumidor, en formato `nombre:clave` separados por coma. El
 # nombre no es decorativo: identifica quién llama en cada línea de log y es la
 # unidad del rate limit, así que se le puede cortar a uno sin cortarle a todos.
@@ -195,9 +218,13 @@ STATEMENT_TIMEOUT_MS = _int("STATEMENT_TIMEOUT_MS", 120000)
 # Tamaño de los pools de PostgreSQL. Cuántas conexiones de zabbix toma cada
 # endpoint a la vez lo declara su propio módulo, en CONEXIONES_ZABBIX_POR_REQUEST:
 # repetir el número acá ya hizo que quedara viejo una vez. main.py verifica al
-# arrancar que el pool alcance para el tope de admisión de cortes.
+# arrancar que el pool alcance para los topes de admisión de los tres endpoints.
+#
+# El default subió de 10 a 16 al empezar a contar los tres consumidores y no
+# solo cortes: 5x2 + 2x2 + 2x1 = 16. Con 10 no entraban, y la alternativa era
+# bajarle la admisión a cortes, que es el endpoint que tiene gente esperando.
 POOL_MIN = _int("POOL_MIN", 1)
-POOL_MAX = _int("POOL_MAX", 10)
+POOL_MAX = _int("POOL_MAX", 16)
 
 
 # --- Detección de cortes (endpoint /api/v1/cortes) ---
@@ -242,6 +269,30 @@ CACHE_MAX_ENTRADAS = _int("CACHE_MAX_ENTRADAS", 5000)
 # marcada como caída indefinidamente.
 CACHE_STALE_MAX_SEG = _int("CACHE_STALE_MAX_SEG", 300)
 
+# Caché de la topología del cliente: su tecnología e IP en Gestión, y su NAP/OLT
+# (o su AP/RouterBoard) en Zabbix. Es lo único de /cortes que NO es estado: la
+# caja de la que cuelga un cliente cambia al provisionarlo o mudarlo, no cuando
+# se cae. Por eso se puede cachear algo por cliente, que en el caché de zona está
+# explícitamente prohibido.
+#
+# Lo que compra no es velocidad, es disponibilidad. Estas dos consultas son las
+# únicas obligatorias del endpoint: si fallan, hoy sale 503 porque sin ellas la
+# respuesta sería inventada. Con un valor anterior utilizable, /cortes puede
+# seguir respondiendo durante una caída de Gestión o de Zabbix, que es
+# exactamente el objetivo de 99% del endpoint.
+#
+# El TTL es corto a propósito: no está para ahorrar consultas —son baratas y van
+# por índice— sino para tener algo guardado cuando la base no conteste. El
+# margen que importa es `STALE`, que solo se usa cuando el recálculo falla.
+#
+# OJO con la IP: si la de un cliente cambia, durante el TTL se pingea la
+# anterior y `isOnline` sale mal. Con IPs fijas es irrelevante; si fueran
+# dinámicas, bajá el TTL (o ponelo en 0, que desactiva el caché entero).
+CACHE_TOPOLOGIA_TTL_SEG = _int("CACHE_TOPOLOGIA_TTL_SEG", 300)
+CACHE_TOPOLOGIA_STALE_MAX_SEG = _int("CACHE_TOPOLOGIA_STALE_MAX_SEG", 3600)
+# Más alto que CACHE_MAX_ENTRADAS: las claves son clientes, no cajas.
+CACHE_TOPOLOGIA_MAX_ENTRADAS = _int("CACHE_TOPOLOGIA_MAX_ENTRADAS", 20000)
+
 # Tope de tiempo de respuesta. Vencido, el cliente recibe 504: el trabajo en
 # curso no se puede matar (son subprocesos y drivers sincrónicos), pero termina
 # solo porque cada paso tiene su propio timeout.
@@ -251,6 +302,23 @@ CORTES_TIMEOUT_SEG = _int("CORTES_TIMEOUT_SEG", 25)
 # apilarse compitiendo por las conexiones del pool. Cada request usa como mucho
 # 2 conexiones de zabbix, así que conviene mantenerlo en POOL_MAX/2 o menos.
 CORTES_MAX_CONCURRENTES = _int("CORTES_MAX_CONCURRENTES", 5)
+
+
+# --- Admisión de los endpoints internos (/precinto y /analytics) ---
+
+# Requests simultáneos de cada endpoint interno. Sin esto los acotaba el
+# threadpool de FastAPI —40 hilos por default, un número que nadie eligió acá— y
+# entre los dos podían pedir más de 100 conexiones sobre un pool de 16.
+#
+# Son tableros, no atención al cliente: la latencia extra de encolar les cuesta
+# mucho menos de lo que le cuesta a /cortes quedarse sin conexiones. Por eso los
+# números son bajos. En 0 se desactiva el tope.
+ANALYTICS_MAX_CONCURRENTES = _int("ANALYTICS_MAX_CONCURRENTES", 2)
+PRECINTO_MAX_CONCURRENTES = _int("PRECINTO_MAX_CONCURRENTES", 2)
+# Cuánto espera un request interno por un lugar antes de rendirse con 503. Es
+# espera en el event loop, no en un hilo, así que encolar es barato; el tope
+# existe para que el consumidor tenga una respuesta y no una conexión colgada.
+INTERNO_ESPERA_SEG = _int("INTERNO_ESPERA_SEG", 10)
 
 # --- Utilidades del sistema: ping ICMP y SNMP ---
 

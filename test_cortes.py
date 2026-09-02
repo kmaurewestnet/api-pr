@@ -46,9 +46,13 @@ def test_cliente_con_dos_tecnologias_resuelve_como_fibra():
     try:
         assert svc.buscar_cliente("1")["is_ftth"] is True
         filas.reverse()
+        # Sin limpiar, la segunda llamada saldria del cache de topologia y el
+        # test dejaria de probar el orden, que es lo que vino a probar.
+        io._topologia.limpiar()
         assert svc.buscar_cliente("1")["is_ftth"] is True
     finally:
         svc._obligatoria = original
+        io._topologia.limpiar()
 
 
 def test_hay_los():
@@ -909,31 +913,43 @@ def test_toda_respuesta_de_error_documenta_su_cuerpo():
 
 
 def test_el_presupuesto_del_pool_de_zabbix_avisa_cuando_no_cierra():
-    """La relacion entre CORTES_MAX_CONCURRENTES y POOL_MAX vivia en un
-    comentario de config.py que nombraba un solo consumidor y traia un numero
-    desactualizado. Ahora cada modulo declara el suyo y esto verifica la cuenta."""
+    """La relacion entre los topes de admision y POOL_MAX vivia en un comentario
+    de config.py que nombraba un solo consumidor y traia un numero
+    desactualizado. Ahora cada modulo declara el suyo y esto verifica la suma."""
     import main
 
-    # Los defaults del repo cierran justo en el borde: 5 x 2 = 10 = POOL_MAX.
-    assert main.revisar_presupuesto_zabbix(10, 5, 2) is None
-    assert main.revisar_presupuesto_zabbix(20, 5, 2) is None
+    def caso(cortes, analytics, precinto):
+        return {
+            "cortes": (2, cortes, "CORTES_MAX_CONCURRENTES"),
+            "analytics": (2, analytics, "ANALYTICS_MAX_CONCURRENTES"),
+            "precinto": (1, precinto, "PRECINTO_MAX_CONCURRENTES"),
+        }
 
-    # Un escalon mas de admision ya no entra, y el aviso dice a cuanto bajar.
-    aviso = main.revisar_presupuesto_zabbix(10, 6, 2)
-    assert aviso and "CORTES_MAX_CONCURRENTES a 5" in aviso
+    # La cuenta es la suma de los tres, no la de cortes solo: 10+4+2 = 16.
+    assert main.revisar_presupuesto_zabbix(16, caso(5, 2, 2)) is None
+    assert main.revisar_presupuesto_zabbix(20, caso(5, 2, 2)) is None
 
-    # Y si cortes pasara a tomar tres conexiones, el tope actual tampoco entra.
-    assert main.revisar_presupuesto_zabbix(10, 5, 3) is not None
+    # Con el POOL_MAX viejo, los mismos topes ya no entran. Es justo el desborde
+    # que no se veia cuando la cuenta miraba un solo consumidor.
+    aviso = main.revisar_presupuesto_zabbix(10, caso(5, 2, 2))
+    assert aviso and "16 conexiones" in aviso, aviso
+    assert "subí POOL_MAX a 16" in aviso, aviso
 
-    # Los tres consumidores estan declarados por su propio modulo.
+    # Un tope en 0 es "sin limite": la suma no se puede calcular y se avisa
+    # aparte, en vez de sumar 0 y declarar que cierra.
+    aviso = main.revisar_presupuesto_zabbix(16, caso(5, 0, 2))
+    assert aviso and "analytics" in aviso and "no tiene tope" in aviso, aviso
+
+    # Los tres consumidores estan declarados por su propio modulo, con su tope.
     assert set(main.CONSUMIDORES_ZABBIX) == {"cortes", "analytics", "precinto"}
-    assert all(c >= 1 for c in main.CONSUMIDORES_ZABBIX.values())
+    assert all(
+        por_req >= 1 and isinstance(var, str)
+        for por_req, _, var in main.CONSUMIDORES_ZABBIX.values()
+    )
 
     # Y la configuracion que se va a desplegar tiene que cerrar.
     assert main.revisar_presupuesto_zabbix(
-        config.POOL_MAX,
-        config.CORTES_MAX_CONCURRENTES,
-        main.CONSUMIDORES_ZABBIX["cortes"],
+        config.POOL_MAX, main.CONSUMIDORES_ZABBIX
     ) is None, "los defaults del repo no cierran"
 
 
@@ -1011,6 +1027,11 @@ def test_el_503_no_revela_nada_de_la_infraestructura():
     # PoolAgotado sigue siendo un 503, no un "no se pudo verificar".
     assert issubclass(db.PoolAgotado, db.DatabaseUnavailable)
 
+    # El repr si nombra la base: es lo que loguea quien solo tiene la excepcion
+    # y no el contexto, como el cache al servir un valor vencido.
+    assert repr(db.DatabaseUnavailable("gestion")) == "DatabaseUnavailable('gestion')"
+    assert repr(db.PoolAgotado("zabbix")) == "PoolAgotado('zabbix')"
+
 
 def test_health_no_le_da_el_mapa_a_una_clave_externa():
     """/health lo alcanzan las claves externas, y es el endpoint que enumera las
@@ -1064,6 +1085,208 @@ def test_el_501_no_nombra_archivos_ni_constantes():
     cuerpo = router_analytics.ENDPOINT_NO_CONFIGURADO
     for filtrado in ("queries/analytics.py", "Q_NAPEAR", "queries", ".py"):
         assert filtrado not in cuerpo, f"el 501 revela '{filtrado}'"
+
+
+def test_la_admision_interna_acota_los_requests_simultaneos():
+    """Sin tope, a precinto y analytics los acotaba el threadpool de FastAPI: 40
+    hilos por 1-2 conexiones de zabbix, sobre un pool de 16. El semaforo es
+    asyncio y no threading a proposito: el que espera no ocupa un hilo."""
+    import asyncio
+    from fastapi import HTTPException
+    from admision import Admision
+
+    async def escenario():
+        adm = Admision("prueba", maximo=2, espera_seg=0.05)
+        en_curso, pico = 0, 0
+
+        async def request(duracion):
+            nonlocal en_curso, pico
+            gen = adm()
+            await gen.__anext__()          # entra, o levanta 503
+            en_curso += 1
+            pico = max(pico, en_curso)
+            try:
+                await asyncio.sleep(duracion)
+            finally:
+                en_curso -= 1
+                try:
+                    await gen.__anext__()  # libera el slot
+                except StopAsyncIteration:
+                    pass
+
+        # Dos entran juntos y el tercero espera; con 0.05s de espera y 0.2s de
+        # ocupacion, no llega a entrar y sale por 503.
+        r = await asyncio.gather(
+            request(0.2), request(0.2), request(0.01), return_exceptions=True
+        )
+        assert pico == 2, f"entraron {pico} a la vez con maximo=2"
+        rechazados = [x for x in r if isinstance(x, HTTPException)]
+        assert len(rechazados) == 1, r
+        # 503 y no 504: el request no llego a empezar, no es que tardo.
+        assert rechazados[0].status_code == 503
+
+        # Liberado el pico, los siguientes vuelven a entrar: el semaforo no se
+        # queda tomado despues de un rechazo.
+        await asyncio.gather(request(0.01), request(0.01))
+        assert en_curso == 0
+
+        # En 0 se desactiva: pasan todos, sin semaforo.
+        libre = Admision("libre", maximo=0, espera_seg=0.01)
+        assert libre._semaforo is None
+        gen = libre()
+        await gen.__anext__()
+        try:
+            await gen.__anext__()
+        except StopAsyncIteration:
+            pass
+
+    asyncio.run(escenario())
+
+
+def test_los_endpoints_internos_cobran_cuota_antes_de_dar_lugar():
+    """Un consumidor pasado de cuota no puede ocupar un slot de admision mientras
+    espera para que despues le respondan 429: primero la cuota, despues el
+    lugar."""
+    from routers import analytics as ra
+    from routers import precinto as rp
+
+    for router in (ra.router, rp.router):
+        deps = [getattr(d.dependency, "__name__", type(d.dependency).__name__)
+                for d in router.dependencies]
+        assert deps == ["limitar_tasa_interna", "Admision"], deps
+
+
+def test_cada_perfil_monta_solo_lo_suyo_y_paga_solo_por_eso():
+    """La misma imagen se despliega dos veces: la critica no monta los endpoints
+    internos, asi que un request mal ruteado da 404 en vez de llevarse dos
+    conexiones del pool que protege a /cortes."""
+    import main
+
+    perfiles = main.ENDPOINTS_POR_PERFIL
+    assert perfiles["critico"] == ("cortes",)
+    assert set(perfiles["interno"]) == {"precinto", "analytics"}
+    # `completo` se deriva de los otros dos y no se escribe aparte: es lo que
+    # impide que un endpoint nuevo quede fuera de un perfil por olvido.
+    assert set(perfiles["completo"]) == set(perfiles["critico"]) | set(perfiles["interno"])
+    # Y cada endpoint declarado tiene un router y un presupuesto.
+    for nombre in perfiles["completo"]:
+        assert nombre in main.ROUTERS, nombre
+        assert nombre in main.TODOS_LOS_CONSUMIDORES, nombre
+
+    # El presupuesto es el de la instancia: la critica no paga por analytics.
+    solo_cortes = {
+        n: v for n, v in main.TODOS_LOS_CONSUMIDORES.items()
+        if n in perfiles["critico"]
+    }
+    assert set(solo_cortes) == {"cortes"}
+    # 5x2 = 10 entra en un pool de 10; los 16 del perfil completo, no.
+    assert main.revisar_presupuesto_zabbix(10, solo_cortes) is None
+    assert main.revisar_presupuesto_zabbix(10, main.TODOS_LOS_CONSUMIDORES)
+
+    # El perfil de este proceso monta lo que dice su tabla, ni mas ni menos.
+    montadas = {r.path for r in main.app.routes if getattr(r, "path", "").startswith("/api")}
+    assert len(montadas) == len(main.ENDPOINTS), montadas
+    # /health va en los tres perfiles: lo consulta el balanceador.
+    assert "/health" in {getattr(r, "path", "") for r in main.app.routes}
+
+
+def test_un_perfil_mal_escrito_no_arranca():
+    """Cayendo al default, un typo en API_PERFIL montaria todo en la instancia
+    critica y el aislamiento se perderia en silencio. Mejor no arrancar."""
+    import subprocess
+
+    entorno = dict(os.environ, API_PERFIL="critco", PYTHONPATH=os.getcwd())
+    r = subprocess.run([sys.executable, "-c", "import config"],
+                       capture_output=True, text=True, env=entorno)
+    assert r.returncode != 0, "un perfil invalido tendria que abortar el arranque"
+    assert "API_PERFIL" in r.stderr and "critco" in r.stderr, r.stderr
+
+    # Y los tres validos si arrancan.
+    for perfil in ("completo", "critico", "interno"):
+        entorno = dict(os.environ, API_PERFIL=perfil, PYTHONPATH=os.getcwd())
+        r = subprocess.run([sys.executable, "-c", "import main"],
+                           capture_output=True, text=True, env=entorno)
+        assert r.returncode == 0, f"{perfil}: {r.stderr}"
+
+
+def test_la_topologia_cacheada_evita_el_503_cuando_la_base_se_cae():
+    """Las dos consultas obligatorias de /cortes son las unicas que dan 503, y
+    son justo las que preguntan por algo que casi no cambia: de que caja cuelga
+    el cliente. Cacheadas, una caida de Gestion o de Zabbix deja de dejar al
+    endpoint sin respuesta, que es de donde salen los nueves."""
+    from services.cache import CacheTTL
+
+    cache = CacheTTL(ttl_seg=60, nombre="t", stale_max_seg=600)
+    caidas = {"n": 0}
+    TOPO = {"nap": "GLL-2763", "olt_nombre": "OLT-CENTRO", "olt_ip": "10.20.0.5"}
+
+    def consultar():
+        if caidas["n"]:
+            raise db.DatabaseUnavailable("zabbix")
+        return TOPO
+
+    # Primera consulta con la base sana: se guarda.
+    assert cache.obtener(("ftth", "302381"), consultar) == TOPO
+
+    # Se cae la base y vence el TTL. Antes esto era un 503; ahora responde con
+    # la topologia de hace un rato, que para una NAP es la misma de siempre.
+    caidas["n"] = 1
+    cache._valores[("ftth", "302381")] = (
+        TOPO, time.monotonic() - 1, time.monotonic() - 1
+    )
+    assert cache.obtener(("ftth", "302381"), consultar) == TOPO
+
+    # Un cliente que nunca se consulto no tiene nada guardado: sigue saliendo
+    # 503. El cache no vuelve inmune al endpoint, protege al que ya paso.
+    try:
+        cache.obtener(("ftth", "999"), consultar)
+        assert False, "sin valor previo tiene que propagar el 503"
+    except db.DatabaseUnavailable:
+        pass
+
+    # Y pasada la ventana de stale se deja de servir: una topologia de horas no
+    # es un dato, es una suposicion.
+    cache._valores[("ftth", "302381")] = (
+        TOPO, time.monotonic() - 1, time.monotonic() - 700
+    )
+    try:
+        cache.obtener(("ftth", "302381"), consultar)
+        assert False, "pasado stale_max tiene que propagar"
+    except db.DatabaseUnavailable:
+        pass
+
+
+def test_el_cliente_dado_de_baja_no_sobrevive_en_el_cache():
+    """Se cachean las filas crudas de Gestion y no el cliente ya resuelto: asi
+    'sin contrato activo' es una lista vacia y no una excepcion. Si
+    ClienteNoEncontrado entrara al cache, un cliente dado de baja seguiria
+    resolviendose con su topologia vieja toda la ventana de stale."""
+    filas = [{"nro_cliente": 1, "categoria_id": 16, "categoria": "FTTH",
+              "ip": "192.168.5.20"}]
+    original = svc._obligatoria
+    svc._obligatoria = lambda base, fn, *a: filas
+    try:
+        io._topologia.limpiar()
+        assert svc.buscar_cliente("1")["is_ftth"] is True
+        # La segunda sale del cache, sin tocar Gestion.
+        svc._obligatoria = lambda *a: (_ for _ in ()).throw(
+            AssertionError("no tendria que consultar Gestion")
+        )
+        assert svc.buscar_cliente("1")["is_ftth"] is True
+
+        # Baja del cliente: la consulta pasa a devolver vacio. Una lista vacia
+        # es un valor, se cachea, y sigue dando 404 en vez de la topologia vieja.
+        io._topologia.limpiar()
+        svc._obligatoria = lambda base, fn, *a: []
+        for _ in range(2):
+            try:
+                svc.buscar_cliente("1")
+                assert False, "un cliente sin contrato activo tiene que dar 404"
+            except svc.ClienteNoEncontrado:
+                pass
+    finally:
+        svc._obligatoria = original
+        io._topologia.limpiar()
 
 
 if __name__ == "__main__":

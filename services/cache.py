@@ -115,8 +115,10 @@ class CacheTTL:
                 hay_previo, previo, edad = self._vencido_utilizable(clave)
                 if not hay_previo:
                     raise
+                # %r y no %s: DatabaseUnavailable tiene el mensaje genérico
+                # que va al 503, y su repr es el que nombra la base.
                 log.warning(
-                    "cache %s: %s falló (%s), se sirve el valor de hace %.0fs",
+                    "cache %s: %s falló (%r), se sirve el valor de hace %.0fs",
                     self._nombre, clave, e, edad,
                 )
                 self._guardar(clave, previo, ahora - edad)

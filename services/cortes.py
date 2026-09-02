@@ -40,7 +40,9 @@ import config
 import db
 from queries import cortes as q
 from services import red
-from services.cortes_io import FuenteReal, _en_paralelo, _regex_ip  # noqa: F401
+from services.cortes_io import (  # noqa: F401
+    FuenteReal, _en_paralelo, _regex_ip, _topologia,
+)
 from services.cortes_reglas import (  # noqa: F401
     TABLA_SNMP,
     decidir_ftth,
@@ -89,12 +91,26 @@ def _obligatoria(base, fn, *args):
         raise db.DatabaseUnavailable(base) from e
 
 
+def _filas_cliente(nro_cliente: str) -> list:
+    """Las filas crudas de Gestión, cacheadas junto al resto de la topología.
+
+    Se cachean las filas y no el cliente ya resuelto para que el caso "sin
+    contrato activo" sea un valor —una lista vacía— y no una excepción: si
+    ClienteNoEncontrado entrara al caché, un cliente dado de baja seguiría
+    resolviéndose con su topología vieja durante toda la ventana de stale.
+    """
+    return _topologia.obtener(
+        ("cliente", nro_cliente),
+        lambda: _obligatoria(
+            "gestion", _mysql, db.gestion_conn, q.Q_GESTION_CLIENTE,
+            (nro_cliente, config.CATEGORIA_FTTH_ID, config.CATEGORIA_WIRELESS_ID),
+        ),
+    )
+
+
 def buscar_cliente(nro_cliente: str) -> dict:
     """Paso 1. Levanta ClienteNoEncontrado si no hay contrato activo."""
-    filas = _obligatoria(
-        "gestion", _mysql, db.gestion_conn, q.Q_GESTION_CLIENTE,
-        (nro_cliente, config.CATEGORIA_FTTH_ID, config.CATEGORIA_WIRELESS_ID),
-    )
+    filas = _filas_cliente(nro_cliente)
     if not filas:
         raise ClienteNoEncontrado(nro_cliente)
 

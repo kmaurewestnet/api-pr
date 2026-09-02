@@ -12,13 +12,18 @@ from models import (
     ERRORES_AUTENTICACION_INTERNA,
     AnalyticsResponse,    error,
 )
+from admision import admitir_analytics
 from security import limitar_tasa_interna
 from services import analytics as svc
 
 log = logging.getLogger(__name__)
 
 router = APIRouter(
-    tags=["analiticas"], dependencies=[Depends(limitar_tasa_interna)]
+    tags=["analiticas"],
+    # Orden intencional: primero la cuota, después el lugar. Al revés, un
+    # consumidor pasado de cuota ocuparía un slot de admisión mientras espera
+    # para que después le respondan 429.
+    dependencies=[Depends(limitar_tasa_interna), Depends(admitir_analytics)],
 )
 
 ESTADOS = svc.CATEGORIAS

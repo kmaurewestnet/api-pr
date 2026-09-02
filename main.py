@@ -27,54 +27,109 @@ log = logging.getLogger(__name__)
 # Los tres consumidores del pool de zabbix, con lo que toma cada uno a la vez.
 # Cada módulo declara el suyo: la cuenta se hacía en un comentario de config.py
 # que nombraba a un solo endpoint y con un número que ya se había quedado viejo.
-CONSUMIDORES_ZABBIX = {
-    "cortes": cortes_io.CONEXIONES_ZABBIX_POR_REQUEST,
-    "analytics": servicio_analytics.CONEXIONES_ZABBIX_POR_REQUEST,
-    "precinto": servicio_precinto.CONEXIONES_ZABBIX_POR_REQUEST,
+# Qué endpoints monta cada perfil. `completo` es la unión, no una lista aparte:
+# repetirla ya sería la forma de que un endpoint nuevo se olvide en un perfil.
+ENDPOINTS_POR_PERFIL = {
+    "critico": ("cortes",),
+    "interno": ("precinto", "analytics"),
+}
+ENDPOINTS_POR_PERFIL["completo"] = tuple(
+    sorted(set(ENDPOINTS_POR_PERFIL["critico"] + ENDPOINTS_POR_PERFIL["interno"]))
+)
+
+ROUTERS = {"cortes": cortes, "analytics": analytics, "precinto": precinto}
+
+# Cada uno con lo que toma a la vez y su tope de admisión. Los tres tienen
+# ahora un tope propio: hasta que precinto y analytics no lo tuvieron, su
+# demanda la fijaba el threadpool de FastAPI y esta cuenta no se podía hacer.
+TODOS_LOS_CONSUMIDORES = {
+    "cortes": (
+        cortes_io.CONEXIONES_ZABBIX_POR_REQUEST,
+        config.CORTES_MAX_CONCURRENTES,
+        "CORTES_MAX_CONCURRENTES",
+    ),
+    "analytics": (
+        servicio_analytics.CONEXIONES_ZABBIX_POR_REQUEST,
+        config.ANALYTICS_MAX_CONCURRENTES,
+        "ANALYTICS_MAX_CONCURRENTES",
+    ),
+    "precinto": (
+        servicio_precinto.CONEXIONES_ZABBIX_POR_REQUEST,
+        config.PRECINTO_MAX_CONCURRENTES,
+        "PRECINTO_MAX_CONCURRENTES",
+    ),
 }
 
 
-def revisar_presupuesto_zabbix(pool_max, concurrentes, por_request):
-    """Aviso si el tope de admisión de cortes no entra en el pool de zabbix.
+# El presupuesto es el de ESTA instancia: la crítica no paga por analytics
+# porque no lo monta. Es lo que hace que POOL_MAX se pueda dimensionar por
+# fleet en vez de tener que cubrir la suma de todos los endpoints en todos lados.
+ENDPOINTS = ENDPOINTS_POR_PERFIL[config.API_PERFIL]
+CONSUMIDORES_ZABBIX = {
+    n: v for n, v in TODOS_LOS_CONSUMIDORES.items() if n in ENDPOINTS
+}
 
-    Solo se verifica cortes: es el único endpoint con control de admisión, así
-    que es el único cuya demanda máxima es un número nuestro. Analytics y
-    precinto los acota el threadpool de FastAPI, y cuando el pool se agota salen
-    por 503 en vez de responder sobre datos que no consultaron.
+
+def revisar_presupuesto_zabbix(pool_max, consumidores):
+    """Aviso si la demanda máxima de los tres endpoints no entra en el pool.
+
+    Antes verificaba solo cortes, porque era el único con control de admisión y
+    el único cuya demanda máxima era un número nuestro. Ahora los tres tienen
+    tope, así que la cuenta es la suma: es lo que puede pedirse a la vez si los
+    tres están llenos al mismo tiempo, que es exactamente el pico que importa.
+
+    Un tope en 0 significa "sin límite" y vuelve la suma incalculable: se avisa
+    aparte en vez de fingir un número.
 
     Devuelve el aviso, o None si los números cierran. No aborta el arranque: un
     operador que sube la concurrencia durante un incidente no debería quedarse
     sin API por eso.
     """
-    demanda = concurrentes * por_request
+    sin_tope = [n for n, (_, c, _) in consumidores.items() if c <= 0]
+    if sin_tope:
+        return (
+            f"{', '.join(sorted(sin_tope))} no tiene tope de admisión, así que su "
+            f"demanda sobre el pool de zabbix (POOL_MAX={pool_max}) no está "
+            f"acotada. Bajo carga se van a agotar las conexiones y los requests "
+            f"van a salir por 503."
+        )
+
+    demanda = sum(por_req * conc for por_req, conc, _ in consumidores.values())
     if demanda <= pool_max:
         return None
+    detalle = " + ".join(
+        f"{n} {conc}x{por_req}"
+        for n, (por_req, conc, _) in sorted(consumidores.items())
+    )
     return (
-        f"CORTES_MAX_CONCURRENTES={concurrentes} por {por_request} conexiones de "
-        f"zabbix da {demanda}, y POOL_MAX={pool_max}. Bajo carga, cortes va a "
-        f"agotar el pool y los requests van a salir por 503: bajá "
-        f"CORTES_MAX_CONCURRENTES a {pool_max // por_request} o subí POOL_MAX."
+        f"La demanda máxima de zabbix es {detalle} = {demanda} conexiones, y "
+        f"POOL_MAX={pool_max}. Bajo carga se va a agotar el pool y los requests "
+        f"van a salir por 503: subí POOL_MAX a {demanda}, o bajá el tope de "
+        f"alguno de los tres. El primero a bajar es analytics, que es un tablero."
     )
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    aviso = revisar_presupuesto_zabbix(
-        config.POOL_MAX,
-        config.CORTES_MAX_CONCURRENTES,
-        CONSUMIDORES_ZABBIX["cortes"],
+    log.info(
+        "Perfil %s: monta %s", config.API_PERFIL, ", ".join(ENDPOINTS) or "nada"
     )
+    aviso = revisar_presupuesto_zabbix(config.POOL_MAX, CONSUMIDORES_ZABBIX)
     if aviso:
         log.warning("Presupuesto del pool de zabbix: %s", aviso)
     log.info(
-        "Pool de zabbix: POOL_MAX=%d | conexiones simultáneas por request: %s",
+        "Pool de zabbix: POOL_MAX=%d | admisión x conexiones por request: %s",
         config.POOL_MAX,
-        ", ".join(f"{n}={c}" for n, c in CONSUMIDORES_ZABBIX.items()),
+        ", ".join(
+            f"{n}={conc}x{por_req}"
+            for n, (por_req, conc, _) in sorted(CONSUMIDORES_ZABBIX.items())
+        ),
     )
     # Los pools se crean de forma diferida al primer uso (ver db.py), así que
     # al apagar solo hace falta liberarlos.
     yield
-    cortes.cerrar_ejecutor()
+    if "cortes" in ENDPOINTS:
+        cortes.cerrar_ejecutor()
     db.close_all()
 
 
@@ -96,6 +151,12 @@ y `snmpget` contra las OLT.
 ## Autenticación
 
 Todos los endpoints, incluido `/health`, requieren la cabecera `X-API-Key`.
+
+> **Esta instancia puede no montarlos todos.** La API se despliega en dos fleets
+> de la misma imagen —uno para `/cortes` y otro para los tableros— para que no
+> compartan proceso ni pool de conexiones. El esquema de abajo lista únicamente
+> los endpoints que **esta** instancia sirve; el resto responde `404` acá y vive
+> detrás del mismo proxy, en la otra ruta.
 
 ```bash
 curl -H "X-API-Key: $API_KEY" "http://localhost:8000/api/v1/cortes/302381"
@@ -184,6 +245,22 @@ antes que a la API.
 La implementación es **en memoria y por proceso**: con N workers de uvicorn el
 límite efectivo equivale a N veces el valor configurado. Con un único proceso el
 valor es exacto.
+
+## Control de admisión
+
+Independiente del rate limit: el rate limit acota la **tasa** por consumidor, la
+admisión acota los requests **simultáneos** de cada endpoint, sin importar quién
+los haga. Es lo que mantiene acotada la demanda sobre el pool de conexiones al
+sistema de monitoreo, que los tres endpoints comparten.
+
+| Endpoint | Simultáneos | Conexiones por request | Al superarse |
+|---|---|---|---|
+| `/cortes` | `CORTES_MAX_CONCURRENTES` (5) | 2 | encola; `504` vencido `CORTES_TIMEOUT_SEG` |
+| `/analytics` | `ANALYTICS_MAX_CONCURRENTES` (2) | 2 | encola; `503` vencido `INTERNO_ESPERA_SEG` |
+| `/precinto` | `PRECINTO_MAX_CONCURRENTES` (2) | 1 | encola; `503` vencido `INTERNO_ESPERA_SEG` |
+
+La suma —16— tiene que entrar en `POOL_MAX`, y la API la verifica al arrancar:
+si no cierra, lo deja escrito en el log con el número al que hay que subirlo.
 
 ## Códigos de error
 
@@ -306,9 +383,8 @@ async def poner_headers_de_limite(request: Request, call_next):
     return respuesta
 
 
-app.include_router(precinto.router)
-app.include_router(analytics.router)
-app.include_router(cortes.router)
+for _nombre in ENDPOINTS:
+    app.include_router(ROUTERS[_nombre].router)
 
 
 # --- Documentación, detrás de la misma API key que el resto -------------------

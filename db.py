@@ -50,6 +50,15 @@ class DatabaseUnavailable(RuntimeError):
         self.nombre = nombre
         super().__init__(mensaje or SERVICIO_NO_DISPONIBLE)
 
+    def __repr__(self) -> str:
+        """Para el log: acá sí va el nombre de la base.
+
+        `str()` es el cuerpo del 503 y se queda genérico; `repr()` es lo que
+        loguean quienes solo tienen la excepción y no el contexto, como el
+        caché al servir un valor vencido.
+        """
+        return f"{type(self).__name__}('{self.nombre}')"
+
 
 # --- Creación de pools ---
 
