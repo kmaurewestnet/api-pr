@@ -587,6 +587,42 @@ por hora, un factor 4.276 de diferencia. Además `items` ya tenía
 `n_tup_hot_upd = 0`: todo update ya rompía HOT y ya mantenía 12 índices, así que
 pasar a 14 es un +17 % sobre 96 updates/hora.
 
+### El camino Solar: acotado, no optimizado
+
+Las tres consultas de arriba no son todas: el camino Solar tiene otras tres, y
+solo una queda cubierta.
+
+| Consulta | Filtra por | Costo |
+|---|---|---|
+| `Q_ZBX_OIDS_LOS_NAP` | `_NAP_EXTRAIDA = %s` | **0,2 ms** — usa `items_nap_extraida_idx` |
+| `Q_ZBX_OID_LOS_CLIENTE` | `_MATCH_CODE_SOLAR` | ~34 ms, 9.659 buffers |
+| `Q_ZBX_OID_ONLINE_CLIENTE` | `_MATCH_CODE_SOLAR` | ~34 ms, 9.660 buffers |
+
+Las dos últimas **no pueden usar el trigram**: está construido sobre
+`split_part(name,'_zone',1)` y ellas buscan sobre otra expresión, la que quita el
+prefijo `ONU LOSi` y los paréntesis. Las filas están adentro del índice —el
+`WHERE` parcial las cubre— pero el término de búsqueda no coincide.
+
+Lo que las salva de un escaneo completo es el `ANALYZE`: el plan entra por
+`hosts` (**3 hosts Solar de 349**) y baja a `items` por `items_hostid_idx`. Aun
+así, esos 3 hosts tienen 30.816 items entre todos, y la expresión Solar se evalúa
+sobre todos ellos.
+
+**Se dejó así a propósito.** Son ~68 ms por request de cliente Solar, y viven
+detrás de un `snmpget` contra la OLT que tarda segundos: optimizarlos no se
+notaría. Entran por índice, que es la diferencia entre caro y roto.
+
+> **Dependen de que `hosts` tenga estadísticas.** Si vuelve a quedar sin
+> analizar, estas dos consultas se caen a un escaneo de las 472.533 filas.
+
+Si alguna vez importa, la salida no es un índice nuevo. Los nombres Solar también
+traen `_zone`, así que la expresión ya indexada contiene el mismo código: alcanza
+con agregar `_MATCH_CODE` como predicado **redundante** al lado del Solar, y el
+trigram existente lo resuelve. Antes hay que verificar un borde —
+`_MATCH_CODE_SOLAR` borra los paréntesis, y `(123)456` se convertiría en `123456`,
+una corrida de dígitos que no existe en el original— comparando las corridas de
+las dos expresiones sobre todos los items Solar.
+
 ### Antes de un upgrade de Zabbix
 
 Los dos índices nuevos son **objetos propios dentro del esquema de Zabbix** y
