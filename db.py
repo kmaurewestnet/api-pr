@@ -127,14 +127,51 @@ class PoolAgotado(DatabaseUnavailable):
     """
 
 
+# psycopg2 no valida lo que presta: una conexión que el servidor, un firewall o
+# un NAT cerraron mientras dormía en el pool vuelve como si nada y falla recién
+# en la primera sentencia del request ("SSL connection has been closed
+# unexpectedly"). Un SELECT 1 antes de prestarla mueve esa falla acá, donde se
+# descarta y se pide otra, en vez de que salga como 500.
+#
+# El tope es para el caso feo: si se reinició el PostgreSQL, las del pool están
+# todas muertas y hay que ir vaciándolas. Cada intento fallido cierra una, así
+# que unos pocos requests dejan el pool sano de nuevo; insistir más acá solo
+# alarga un request que ya sabemos que va mal.
+_INTENTOS_CONEXION = 3
+
+
+def _getconn_pg(pool, nombre: str):
+    """Presta una conexión del pool que ya demostró estar viva."""
+    for intento in range(1, _INTENTOS_CONEXION + 1):
+        try:
+            conn = pool.getconn()
+        except psycopg2.pool.PoolError as e:
+            log.error(
+                "Pool de %s agotado (POOL_MAX=%s): %s", nombre, config.POOL_MAX, e
+            )
+            raise PoolAgotado(nombre) from e
+        except psycopg2.Error as e:
+            # Acá no hay nada que descartar: la base no acepta conexiones nuevas.
+            # Reintentar solo suma un connect_timeout por vuelta.
+            log.error("No se pudo conectar a %s: %s", nombre, e)
+            raise DatabaseUnavailable(nombre) from e
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+            return conn
+        except psycopg2.Error as e:
+            log.warning(
+                "Conexión muerta de %s, se descarta (%d/%d): %s",
+                nombre, intento, _INTENTOS_CONEXION, e,
+            )
+            pool.putconn(conn, close=True)
+    raise DatabaseUnavailable(nombre)
+
+
 @contextmanager
 def _conexion_pg(nombre: str):
     pool = _pool(nombre)
-    try:
-        conn = pool.getconn()
-    except psycopg2.pool.PoolError as e:
-        log.error("Pool de %s agotado (POOL_MAX=%s): %s", nombre, config.POOL_MAX, e)
-        raise PoolAgotado(nombre) from e
+    conn = _getconn_pg(pool, nombre)
     try:
         yield conn
     finally:
@@ -179,6 +216,15 @@ def _conexion_mysql(nombre: str):
     except PoolError as e:
         log.error("Pool de %s agotado (POOL_MAX=%s): %s", nombre, config.POOL_MAX, e)
         raise PoolAgotado(nombre) from e
+    try:
+        # El pool de mysql-connector tampoco valida lo que presta. ping() con
+        # reconnect revive la que se murió ociosa, que es lo mismo que hace el
+        # SELECT 1 del lado de PostgreSQL.
+        conn.ping(reconnect=True)
+    except Exception as e:
+        conn.close()
+        log.error("Conexión muerta de %s y no reconecta: %s", nombre, e)
+        raise DatabaseUnavailable(nombre) from e
     try:
         yield conn
     finally:

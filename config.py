@@ -136,13 +136,27 @@ PRECINTO_MAX_FILAS = _int("PRECINTO_MAX_FILAS", 50000)
 # Zabbix conserva los nombres de variable originales para no romper el .env en
 # producción. Soldef y Napear usan la convención DB_<BASE>_* de obras/.env.example.
 
+# Opciones comunes a las tres bases PostgreSQL. Los keepalives son para las
+# conexiones que duermen en el pool: sin ellos, un firewall o un NAT que se
+# olvida de la sesión deja un socket que parece vivo y solo falla al usarlo, y
+# si del otro lado no llega un RST esa falla tarda minutos. Con esto el kernel
+# la da por muerta en ~1 minuto (30 s de ocio + 3 sondas cada 10) y el pool la
+# repone en vez de prestarla.
+_PG_COMUN = {
+    "connect_timeout": 10,
+    "keepalives": 1,
+    "keepalives_idle": 30,
+    "keepalives_interval": 10,
+    "keepalives_count": 3,
+}
+
 ZBX_DSN = {
     "host": os.getenv("DB_HOST", "localhost"),
     "port": _int("DB_PORT", 5432),
     "dbname": os.getenv("DB_NAME", "zabbix"),
     "user": os.getenv("DB_USER", "zabbix"),
     "password": os.getenv("DB_PASS", ""),
-    "connect_timeout": 10,
+    **_PG_COMUN,
 }
 
 
@@ -155,7 +169,7 @@ def soldef_dsn() -> dict:
         "dbname": _require("DB_SOLDEF_NAME"),
         "user": _require("DB_SOLDEF_USER"),
         "password": _require("DB_SOLDEF_PASS"),
-        "connect_timeout": 10,
+        **_PG_COMUN,
     }
 
 
@@ -193,7 +207,7 @@ def zbx_wireless_dsn() -> dict:
         "dbname": _require("DB_ZBX_WIFI_NAME"),
         "user": _require("DB_ZBX_WIFI_USER"),
         "password": _require("DB_ZBX_WIFI_PASS"),
-        "connect_timeout": 10,
+        **_PG_COMUN,
     }
 
 

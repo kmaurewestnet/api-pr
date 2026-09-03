@@ -1304,6 +1304,63 @@ def test_el_cliente_dado_de_baja_no_sobrevive_en_el_cache():
         io._topologia.limpiar()
 
 
+def test_conexion_muerta_no_sale_del_pool():
+    """El pool de psycopg2 presta conexiones que el servidor ya cerro: el
+    SELECT 1 de control tiene que descartarlas y entregar una viva, en vez de
+    dejar que revienten en la primera consulta del request con un 500."""
+    import psycopg2
+
+    class _Cursor:
+        def __init__(self, conn):
+            self.conn = conn
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, args=None):
+            if not self.conn.viva:
+                raise psycopg2.OperationalError(
+                    "SSL connection has been closed unexpectedly"
+                )
+
+    class _Conn:
+        def __init__(self, viva):
+            self.viva = viva
+
+        def cursor(self):
+            return _Cursor(self)
+
+    class _Pool:
+        def __init__(self, conns):
+            self.conns = list(conns)
+            self.cerradas = []
+
+        def getconn(self):
+            return self.conns.pop(0)
+
+        def putconn(self, conn, close=False):
+            if close:
+                self.cerradas.append(conn)
+
+    muerta, viva = _Conn(False), _Conn(True)
+    pool = _Pool([muerta, viva])
+    assert db._getconn_pg(pool, "soldef") is viva
+    assert pool.cerradas == [muerta], "la muerta tenia que quedar fuera del pool"
+
+    # Todas muertas (un reinicio de PostgreSQL): 503, no un 500 con el
+    # traceback de psycopg2 saliendo desde el medio del request.
+    pool = _Pool([_Conn(False) for _ in range(db._INTENTOS_CONEXION)])
+    try:
+        db._getconn_pg(pool, "soldef")
+        raise AssertionError("tenia que dar DatabaseUnavailable")
+    except db.DatabaseUnavailable as e:
+        assert e.nombre == "soldef"
+    assert len(pool.cerradas) == db._INTENTOS_CONEXION
+
+
 if __name__ == "__main__":
     pruebas = [v for n, v in sorted(vars().items())
                if n.startswith("test_") and callable(v)]
